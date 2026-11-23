@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Start Claude in the current workspace with only this workspace's MCP servers and settings.
+# Extra arguments pass through to claude, for example: bin/master-foreman --add-dir ~/code/app
+set -euo pipefail
+
+workspace="$(pwd)"
+mcp_list="$workspace/foreman.mcp.json"
+
+if [[ ! -e "$workspace/.claude/skills/master-foreman/SKILL.md" ]]; then
+  echo "No .claude/skills/master-foreman here. Run this from a foreman workspace." >&2
+  exit 1
+fi
+
+if [[ ! -f "$mcp_list" ]]; then
+  template="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+  cp "$template/core/mcp.example.json" "$mcp_list"
+fi
+
+# Give Claude every local repo named in the config, so no permission prompt interrupts a phase.
+add_dirs=()
+if [[ -f "$workspace/foreman.config.md" ]]; then
+  while IFS= read -r repo; do
+    repo="${repo/#\~/$HOME}"
+    [[ -d "$repo" ]] && add_dirs+=(--add-dir "$repo")
+  done < <(sed -n 's/^- path:[[:space:]]*\(.*[^[:space:]]\)[[:space:]]*$/\1/p' "$workspace/foreman.config.md")
+fi
+
+exec claude \
+  --strict-mcp-config \
+  --mcp-config "$mcp_list" \
+  --setting-sources project,local \
+  ${add_dirs[@]+"${add_dirs[@]}"} \
+  "$@"

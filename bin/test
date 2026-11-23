@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Run every nufra test. Extra local suites (outside this repo) can be added with
+# NUFRA_EXTRA_TESTS="dir1:dir2"; each dir is run with `python -m unittest discover`.
+set -uo pipefail
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+fail=0
+echo "== nufra tests"
+python3 -m unittest discover -s "$root/tests" -p 'test_*.py' -v 2>&1 | tail -n 25 || true
+python3 -m unittest discover -s "$root/tests" -p 'test_*.py' >/dev/null 2>&1 || fail=1
+IFS=':' read -r -a extra <<< "${NUFRA_EXTRA_TESTS:-}"
+for d in "${extra[@]}"; do
+  [[ -z "$d" ]] && continue
+  py="python3"; [[ -x "$d/../venv/bin/python" ]] && py="$d/../venv/bin/python"
+  echo "== extra tests: $d"
+  "$py" -m unittest discover -s "$d" -p 'test_*.py' -v 2>&1 | tail -n 15
+  "$py" -m unittest discover -s "$d" -p 'test_*.py' >/dev/null 2>&1 || fail=1
+done
+[[ $fail -eq 0 ]] && echo "ALL PASS" || echo "FAILED"
+exit $fail

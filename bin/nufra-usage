@@ -1,0 +1,346 @@
+#!/usr/bin/env python3
+"""nufra-usage: read-only usage meter for local agent harnesses.
+
+Reads only local files under ~/.claude, ~/.codex and ~/.gemini. No network.
+Writes nothing except to stdout. Parses only usage / token / rate_limits
+fields; prompt and response text is never kept or printed.
+
+Usage: nufra-usage [--json] [--days N] [--home DIR]
+"""
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+
+UTC = dt.timezone.utc
+
+
+def parse_ts(value):
+    """ISO-8601 string or epoch number -> aware datetime, else None."""
+    if value is None:
+        return None
+    try:
+        if isinstance(value, (int, float)):
+            return dt.datetime.fromtimestamp(value / 1000 if value > 1e11 else value, UTC)
+        s = str(value).strip()
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        t = dt.datetime.fromisoformat(s)
+        return t if t.tzinfo else t.replace(tzinfo=UTC)
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def iso(t):
+    return t.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ") if t else None
+
+
+def num(v):
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else 0
+
+
+def files_newest_first(roots, suffixes):
+    out = []
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        for d, _, names in os.walk(root):
+            for n in names:
+                if n.endswith(suffixes):
+                    p = os.path.join(d, n)
+                    try:
+                        out.append((os.path.getmtime(p), p))
+                    except OSError:
+                        pass
+    out.sort(reverse=True)
+    return out
+
+
+def cli_version(name):
+    """Version from the resolved install path of the CLI. Never runs the CLI."""
+    p = shutil.which(name)
+    if not p:
+        return None
+    m = re.search(r"/(\d+\.\d+\.\d+[0-9A-Za-z.\-]*)(?:/|$)", os.path.realpath(p))
+    return m.group(1) if m else None
+
+
+def jsonl_lines(path):
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            yield line
+
+
+def new_result(harness):
+    return {
+        "harness": harness, "status": "ok", "cli_version": cli_version(harness),
+        "tokens_window": 0, "breakdown": {}, "records_with_usage": 0,
+        "records_without_usage": 0, "limit": None, "newest": None,
+        "method": None, "notes": [],
+    }
+
+
+def bump(res, key, v):
+    res["breakdown"][key] = res["breakdown"].get(key, 0) + num(v)
+
+
+def set_newest(res, path, t):
+    if t and (res["newest"] is None or t > parse_ts(res["newest"]["timestamp"])):
+        res["newest"] = {"file": path, "timestamp": iso(t)}
+
+
+# ---------------------------------------------------------------- claude
+CLAUDE_FIELDS = ("input_tokens", "output_tokens",
+                 "cache_creation_input_tokens", "cache_read_input_tokens")
+
+
+def read_claude(home, cutoff):
+    base = os.path.join(home, ".claude")
+    if not os.path.isdir(base):
+        return {"harness": "claude", "status": "not configured"}
+    res = new_result("claude")
+    res["method"] = "~/.claude/projects/**/*.jsonl message.usage (dedup by message.id+requestId)"
+    seen = set()
+    for mtime, path in files_newest_first([os.path.join(base, "projects")], (".jsonl",)):
+        in_window = mtime >= cutoff.timestamp()
+        if not in_window and res["newest"] is not None:
+            break
+        try:
+            for line in jsonl_lines(path):
+                if '"assistant"' not in line:
+                    continue
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(r, dict) or r.get("type") != "assistant":
+                    continue
+                msg = r.get("message")
+                usage = msg.get("usage") if isinstance(msg, dict) else None
+                t = parse_ts(r.get("timestamp"))
+                if not isinstance(usage, dict):
+                    res["records_without_usage"] += 1
+                    continue
+                key = (msg.get("id"), r.get("requestId")) if msg.get("id") else ("uuid", r.get("uuid"))
+                if key in seen:
+                    continue
+                seen.add(key)
+                set_newest(res, path, t)
+                if t and t >= cutoff:
+                    res["records_with_usage"] += 1
+                    for f in CLAUDE_FIELDS:
+                        bump(res, f, usage.get(f))
+                        res["tokens_window"] += num(usage.get(f))
+        except OSError as e:
+            res["notes"].append("unreadable: %s (%s)" % (path, e.__class__.__name__))
+    res["notes"].append("weekly limit: not measured (no limit field found on disk)")
+    return res
+
+
+# ---------------------------------------------------------------- codex
+def zstd_reader():
+    """Return a function path -> iterator of text lines for .zst files, or None."""
+    if sys.version_info >= (3, 14):
+        try:
+            from compression import zstd as _z  # type: ignore
+            import io
+
+            def _py(path):
+                with _z.open(path, "rb") as fh:
+                    for line in io.TextIOWrapper(fh, encoding="utf-8", errors="replace"):
+                        yield line
+            return _py, "python compression.zstd"
+        except ImportError:
+            pass
+    exe = shutil.which("zstd")
+    if exe:
+        def _cli(path):
+            p = subprocess.Popen([exe, "-dcq", path], stdout=subprocess.PIPE,
+                                 stderr=subprocess.DEVNULL)
+            try:
+                for raw in p.stdout:
+                    yield raw.decode("utf-8", "replace")
+            finally:
+                p.stdout.close()
+                p.wait()
+        return _cli, "zstd binary (%s)" % exe
+    return None, None
+
+
+def codex_sqlite_fallback(base, cutoff, res):
+    db = os.path.join(base, "state_5.sqlite")
+    if not os.path.isfile(db):
+        res["notes"].append("no zstd reader and no state_5.sqlite: tokens not measured")
+        res["tokens_window"] = None
+        return
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % db, uri=True)
+        rows = con.execute(
+            "SELECT tokens_used, updated_at FROM threads WHERE updated_at >= ?",
+            (int(cutoff.timestamp()),)).fetchall()
+        newest = con.execute("SELECT MAX(updated_at) FROM threads").fetchone()[0]
+        con.close()
+    except sqlite3.Error as e:
+        res["notes"].append("state_5.sqlite unreadable (%s)" % e.__class__.__name__)
+        res["tokens_window"] = None
+        return
+    res["method"] = "state_5.sqlite threads.tokens_used (whole-thread totals, not windowed)"
+    res["tokens_window"] = sum(num(r[0]) for r in rows)
+    res["records_with_usage"] = len(rows)
+    set_newest(res, db, parse_ts(newest))
+
+
+def read_codex(home, cutoff, force_sqlite=False):
+    base = os.path.join(home, ".codex")
+    if not os.path.isdir(base):
+        return {"harness": "codex", "status": "not configured"}
+    res = new_result("codex")
+    zread, zname = (None, None) if force_sqlite else zstd_reader()
+    roots = [os.path.join(base, "sessions"), os.path.join(base, "archived_sessions")]
+    files = files_newest_first(roots, (".jsonl", ".jsonl.zst"))
+    has_zst = any(p.endswith(".zst") for _, p in files)
+    if force_sqlite or (has_zst and zread is None):
+        codex_sqlite_fallback(base, cutoff, res)
+        res["notes"].append("rate limits: not measured (session files need zstd)")
+        return res
+    res["method"] = "rollout *.jsonl[.zst] token_count events via %s" % (zname or "plain jsonl")
+    newest_limit = None  # (t, path, primary)
+    for mtime, path in files:
+        in_window = mtime >= cutoff.timestamp()
+        if not in_window and newest_limit is not None and res["newest"] is not None:
+            break
+        lines = zread(path) if path.endswith(".zst") else jsonl_lines(path)
+        before, last_in = 0, None
+        try:
+            for line in lines:
+                if "token_count" not in line:
+                    continue
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                p = r.get("payload") if isinstance(r, dict) else None
+                if not isinstance(p, dict) or p.get("type") != "token_count":
+                    continue
+                t = parse_ts(r.get("timestamp"))
+                rl = p.get("rate_limits")
+                prim = rl.get("primary") if isinstance(rl, dict) else None
+                if isinstance(prim, dict) and t and (newest_limit is None or t > newest_limit[0]):
+                    newest_limit = (t, path, prim)
+                info = p.get("info")
+                tot = info.get("total_token_usage") if isinstance(info, dict) else None
+                if not isinstance(tot, dict):
+                    res["records_without_usage"] += 1
+                    continue
+                set_newest(res, path, t)
+                if t and t >= cutoff:
+                    last_in = tot
+                    res["records_with_usage"] += 1
+                else:
+                    before = num(tot.get("total_tokens"))
+        except OSError as e:
+            res["notes"].append("unreadable: %s (%s)" % (path, e.__class__.__name__))
+        if last_in is not None:
+            # cumulative counter per session: window = last value in window - last value before it
+            res["tokens_window"] += max(0, num(last_in.get("total_tokens")) - before)
+            for k in ("input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens"):
+                bump(res, k, last_in.get(k))
+    if newest_limit:
+        t, path, prim = newest_limit
+        ra = parse_ts(prim.get("resets_at"))
+        res["limit"] = {
+            "used_percent": prim.get("used_percent"),
+            "window_minutes": prim.get("window_minutes"),
+            "resets_at": iso(ra),
+            "file": path, "timestamp": iso(t),
+        }
+    else:
+        res["notes"].append("weekly limit: not measured (no rate_limits record found)")
+    return res
+
+
+# ---------------------------------------------------------------- gemini
+def read_gemini(home, cutoff):
+    base = os.path.join(home, ".gemini")
+    if not os.path.isdir(base):
+        return {"harness": "gemini", "status": "not configured"}
+    res = new_result("gemini")
+    res["method"] = "~/.gemini/tmp/*/chats/*.json messages[].tokens.total"
+    seen = set()
+    for _, path in files_newest_first([os.path.join(base, "tmp")], (".json",)):
+        if os.sep + "chats" + os.sep not in path:
+            continue
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                d = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        msgs = d.get("messages") if isinstance(d, dict) else None
+        for m in msgs if isinstance(msgs, list) else []:
+            if not isinstance(m, dict) or m.get("type") != "gemini":
+                continue
+            tok = m.get("tokens")
+            if not isinstance(tok, dict):
+                res["records_without_usage"] += 1
+                continue
+            key = (path, m.get("id")) if m.get("id") is None else m.get("id")
+            if key in seen:
+                continue
+            seen.add(key)
+            t = parse_ts(m.get("timestamp"))
+            set_newest(res, path, t)
+            if t and t >= cutoff:
+                res["records_with_usage"] += 1
+                res["tokens_window"] += num(tok.get("total"))
+                for k in ("input", "cached", "output", "thoughts", "tool"):
+                    bump(res, k, tok.get(k))
+    res["notes"].append("weekly limit: not measured (no quota field on disk)")
+    return res
+
+
+# ---------------------------------------------------------------- output
+def line_for(r, days):
+    if r["status"] != "ok":
+        return "%-7s | %s" % (r["harness"], r["status"])
+    ver = r["cli_version"] or "unknown"
+    tok = "not measured" if r["tokens_window"] is None else "{:,}".format(r["tokens_window"])
+    lim = r["limit"]
+    if lim:
+        lim_s = "limit: primary %s%% used, window %s min, resets %s" % (
+            lim["used_percent"], lim["window_minutes"], lim["resets_at"])
+    else:
+        lim_s = "weekly limit: not measured"
+    nw = r["newest"]
+    nw_s = "%s @ %s" % (nw["file"], nw["timestamp"]) if nw else "no reading"
+    return "%-7s | cli %s | %dd tokens %s | %s | newest: %s" % (
+        r["harness"], ver, days, tok, lim_s, nw_s)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="Read-only local usage meter.")
+    ap.add_argument("--json", action="store_true", help="print JSON instead of lines")
+    ap.add_argument("--days", type=int, default=7)
+    ap.add_argument("--home", default=os.path.expanduser("~"), help=argparse.SUPPRESS)
+    ap.add_argument("--codex-sqlite", action="store_true", help=argparse.SUPPRESS)
+    a = ap.parse_args(argv)
+    now = dt.datetime.now(UTC)
+    cutoff = now - dt.timedelta(days=a.days)
+    results = [read_claude(a.home, cutoff),
+               read_codex(a.home, cutoff, force_sqlite=a.codex_sqlite),
+               read_gemini(a.home, cutoff)]
+    if a.json:
+        print(json.dumps({"generated_at": iso(now), "window_days": a.days,
+                          "window_start": iso(cutoff), "harnesses": results}, indent=2))
+    else:
+        for r in results:
+            print(line_for(r, a.days))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

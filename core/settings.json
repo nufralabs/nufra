@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "ask": [
+      "WebFetch",
+      "WebSearch"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "^mcp__",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/block-undeclared-mcp.py"
+          }
+        ]
+      }
+    ]
+  }
+}
