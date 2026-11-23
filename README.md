@@ -6,7 +6,8 @@ nufra runs one gated coding workflow (the master-foreman template: phases, human
 lets you move a phase to another coding harness only on your command, between phases. It shows the weekly usage of
 each harness. One agent at a time. Local first.
 
-Status: v0.1 in progress, private. Not for public use yet. Solo project, best-effort support.
+Status: v0.1 in progress. Early: expect breaking changes. Solo project, best-effort support.
+nufra switches a harness only on your command and never rotates accounts.
 
 ## Layout
 
