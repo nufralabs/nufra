@@ -8,7 +8,7 @@ echo "== nufra tests"
 python3 -m unittest discover -s "$root/tests" -p 'test_*.py' -v 2>&1 | tail -n 25 || true
 python3 -m unittest discover -s "$root/tests" -p 'test_*.py' >/dev/null 2>&1 || fail=1
 IFS=':' read -r -a extra <<< "${NUFRA_EXTRA_TESTS:-}"
-for d in "${extra[@]}"; do
+for d in ${extra[@]+"${extra[@]}"}; do
   [[ -z "$d" ]] && continue
   py="python3"; [[ -x "$d/../venv/bin/python" ]] && py="$d/../venv/bin/python"
   echo "== extra tests: $d"
