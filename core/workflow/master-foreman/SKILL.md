@@ -255,6 +255,10 @@ is what lets a later session resume without re-deriving anything.
   (one line), `open gate` (none, 2.5 or 6.5, with the question ts), `harness` (who holds the pen:
   `claude`, `codex`, `gemini`), `cli_version`, `adapter` (launcher path, or `none`), `written` (date
   and time). Context that is not in a footprint or in `handoff.md` is lost at a stop.
+  Write it only with `bin/nufra-handoff write runs/<name> --phase "<N> done, next <M>" --next "<one line>"
+  --repo <worktree> --footprint <path> [--gate 2.5 --gate-ts <ts>] [--harness codex --adapter <path>]`.
+  It writes a temp file and renames it, so a stop leaves the old file or the new one, never half a file.
+  It refuses a missing field and a value that looks like a secret. Never edit `handoff.md` by hand.
 
 ## Phase notes
 
@@ -310,8 +314,9 @@ Phases 6 and 7 consume the outputs of 0 to 5. In a fresh session, reconstruct th
 before touching code, and state what you found:
 
 1. **Branches:** does the branch exist, on a current base? If missing, run phase 0. If far behind, say so.
-2. **`runs/<name>/`:** read `handoff.md` first when it exists. Check that `branch` and `sha` match the
-   working tree, verify the `last footprint` exists, and run the tests again before you trust it. If
+2. **`runs/<name>/`:** read `handoff.md` first when it exists. Run `bin/nufra-handoff check runs/<name> --repo
+   <worktree>`: it checks every field, that `branch` and `sha` match the working tree and that the `last
+   footprint` exists. If it says NOT SAFE, stop and say why. Then run the tests again before you trust it. If
    another harness held the pen, verify its footprint like any subagent reply. Then read the rest. An approval already in `proof-plan.md` stands, re-gate only what
    changed. If the folder is missing or thin, treat earlier conclusions as unverified and say so.
 3. **`test-cases.md`:** this is phase 7's spec. N cases means N takes.
@@ -372,9 +377,9 @@ Short instructions given mid-pipeline. No phase, no gate. Do them and report in 
 
 **"pause"** (also: the weekly quota is near its end, or a quota error stopped a phase). Stop at the
 next phase boundary, never mid-phase. If a phase is open, let it finish or stop it, and record which.
-Write the ledger row of the open phase, rewrite `runs/<name>/handoff.md` (footprint rule), and append
-one row to `runs/quota-stops.md` (`| date | run | phase | reason | days lost |`; create it with that
-header if missing). Then stop and say where the run will resume. A switch to another harness happens
+Write the ledger row of the open phase, then run `bin/nufra-handoff write ... --stop "<reason>" --days-lost <N>`:
+it rewrites `runs/<name>/handoff.md` (footprint rule) and appends one row to `runs/quota-stops.md`
+(`| date | run | phase | reason | days lost |`). Then stop and say where the run will resume. A switch to another harness happens
 only on the user's command and only at this boundary. Claude Code stays the only coordinator: another
 harness runs a single phase from a brief and `handoff.md`, never opens a gate, and runs only through an
 adapter that passed the guard tests (the 4 guard tests: a prod MCP call fails, network goes only to the model API, a gate stops with no quoted approval, one agent at a time). Source: user ruling, 2026-11-23, and the engineering council (round 1 and round 4).

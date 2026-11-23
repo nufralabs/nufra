@@ -1,0 +1,225 @@
+#!/usr/bin/env python3
+"""nufra-handoff: write and check the resume point of a run (runs/<name>/handoff.md).
+
+write   Write handoff.md safely: a temp file in the same folder, fsync, then rename.
+        A stop at any moment leaves the old handoff.md or the new one, never half a file.
+        Refuses a missing field, an unknown harness or gate, and a value that looks like a secret.
+        With --stop REASON it also appends one row to <runs>/quota-stops.md.
+check   Read handoff.md and verify it before a resume: all fields present, branch and sha match
+        the repo, the last footprint exists. Exit 0 = safe to resume, 1 = not safe (reasons printed).
+
+Usage:
+  nufra-handoff write RUN_DIR --phase "3 done, next 4" --next "one line" [--repo PATH]
+        [--branch B --sha S] [--footprint PATH] [--gate none|2.5|6.5] [--gate-ts TS]
+        [--harness claude|codex|gemini] [--cli-version V] [--adapter PATH|none]
+        [--stop REASON] [--days-lost N]
+  nufra-handoff check RUN_DIR [--repo PATH] [--json]
+
+Stdlib only. No network.
+"""
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+
+FIELDS = ("phase", "branch", "sha", "last footprint", "next action", "open gate",
+          "harness", "cli_version", "adapter", "written")
+HARNESSES = ("claude", "codex", "gemini")
+GATES = ("none", "2.5", "6.5")
+SECRET = re.compile(r"(sk-[A-Za-z0-9_-]{8,}|xox[abprs]-[A-Za-z0-9-]{8,}|gh[pousr]_[A-Za-z0-9]{16,}"
+                    r"|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----)")
+STOPS_HEADER = "| date | run | phase | reason | days lost |\n|---|---|---|---|---|\n"
+TEMP_PREFIX = ".handoff.md."
+
+
+def die(msg, code=2):
+    print(f"nufra-handoff: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def git(repo, *args):
+    r = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def cli_version(harness):
+    try:
+        r = subprocess.run([harness, "--version"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    m = re.search(r"\d+\.\d+\.\d+", r.stdout + r.stderr)
+    return m.group(0) if m else None
+
+
+def render(run, values):
+    lines = [f"# Handoff: {run}", ""]
+    lines += [f"- {k}: {values[k]}" for k in FIELDS]
+    return "\n".join(lines) + "\n"
+
+
+def parse(text):
+    out = {}
+    for line in text.splitlines():
+        m = re.match(r"^- ([a-z_ ]+): (.*)$", line)
+        if m and m.group(1) in FIELDS:
+            out[m.group(1)] = m.group(2).strip()
+    return out
+
+
+def fsync_dir(path):
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def atomic_write(path, text):
+    folder = os.path.dirname(os.path.abspath(path))
+    for name in os.listdir(folder):  # remove temps left by an earlier stop
+        if name.startswith(TEMP_PREFIX):
+            try:
+                os.remove(os.path.join(folder, name))
+            except OSError:
+                pass
+    fd, tmp = tempfile.mkstemp(prefix=TEMP_PREFIX, dir=folder)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        if os.environ.get("NUFRA_HANDOFF_TEST_CRASH") == "before-rename":
+            os._exit(9)  # test hook: simulate a stop between write and rename
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
+    fsync_dir(folder)
+
+
+def cmd_write(a):
+    run_dir = os.path.abspath(a.run_dir)
+    if not os.path.isdir(run_dir):
+        die(f"no run folder: {run_dir}")
+    branch, sha = a.branch, a.sha
+    if a.repo:
+        branch = branch or git(a.repo, "rev-parse", "--abbrev-ref", "HEAD")
+        sha = sha or git(a.repo, "rev-parse", "HEAD")
+    if a.harness not in HARNESSES:
+        die(f"unknown harness '{a.harness}' (allowed: {', '.join(HARNESSES)})")
+    if a.gate not in GATES:
+        die(f"unknown gate '{a.gate}' (allowed: {', '.join(GATES)})")
+    if a.gate != "none" and not a.gate_ts:
+        die("an open gate needs --gate-ts (the question ts)")
+    gate = a.gate if a.gate == "none" else f"{a.gate} (question ts {a.gate_ts})"
+    values = {
+        "phase": a.phase, "branch": branch, "sha": sha,
+        "last footprint": a.footprint, "next action": a.next, "open gate": gate,
+        "harness": a.harness, "cli_version": a.cli_version or cli_version(a.harness),
+        "adapter": a.adapter,
+        "written": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    missing = [k for k in FIELDS if not values.get(k)]
+    if missing:
+        die("missing field(s): " + ", ".join(missing) + " (nothing written)")
+    for k, v in values.items():
+        if "\n" in v:
+            die(f"field '{k}' must be one line (nothing written)")
+        if SECRET.search(v):
+            die(f"field '{k}' looks like a secret; name the env variable instead (nothing written)")
+    path = os.path.join(run_dir, "handoff.md")
+    atomic_write(path, render(os.path.basename(run_dir), values))
+    print(f"wrote {path}")
+    if a.stop:
+        stops = os.path.join(os.path.dirname(run_dir), "quota-stops.md")
+        new = not os.path.exists(stops)
+        with open(stops, "a") as fh:
+            if new:
+                fh.write("# Quota stops\n\n" + STOPS_HEADER)
+            fh.write(f"| {values['written'][:10]} | {os.path.basename(run_dir)} | {a.phase} "
+                     f"| {a.stop} | {a.days_lost} |\n")
+        print(f"appended {stops}")
+
+
+def cmd_check(a):
+    run_dir = os.path.abspath(a.run_dir)
+    path = os.path.join(run_dir, "handoff.md")
+    problems = []
+    if not os.path.exists(path):
+        problems.append(f"no handoff.md in {run_dir}")
+        values = {}
+    else:
+        with open(path) as fh:
+            values = parse(fh.read())
+        missing = [k for k in FIELDS if not values.get(k)]
+        if missing:
+            problems.append("missing field(s): " + ", ".join(missing))
+        if values.get("harness") and values["harness"] not in HARNESSES:
+            problems.append(f"unknown harness '{values['harness']}'")
+        fp = values.get("last footprint")
+        if fp:
+            base = a.repo or os.path.dirname(os.path.dirname(run_dir))
+            if not any(os.path.exists(p) for p in (fp, os.path.join(base, fp), os.path.join(run_dir, fp))):
+                problems.append(f"last footprint not found: {fp}")
+        if a.repo:
+            head_branch = git(a.repo, "rev-parse", "--abbrev-ref", "HEAD")
+            head_sha = git(a.repo, "rev-parse", "HEAD")
+            if head_branch is None:
+                problems.append(f"not a git repo: {a.repo}")
+            else:
+                if values.get("branch") and values["branch"] != head_branch:
+                    problems.append(f"branch mismatch: handoff {values['branch']}, repo {head_branch}")
+                if values.get("sha") and values["sha"] != head_sha:
+                    problems.append(f"sha mismatch: handoff {values['sha'][:12]}, repo {head_sha[:12]}")
+    ok = not problems
+    if a.json:
+        print(json.dumps({"ok": ok, "problems": problems, "handoff": values}, indent=2))
+    else:
+        if ok:
+            print(f"OK: resume at '{values['phase']}', next action: {values['next action']}")
+        for p in problems:
+            print(f"NOT SAFE: {p}")
+    return 0 if ok else 1
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="nufra-handoff", description=__doc__.split("\n")[0])
+    sub = p.add_subparsers(dest="cmd", required=True)
+    w = sub.add_parser("write")
+    w.add_argument("run_dir")
+    w.add_argument("--phase", required=True)
+    w.add_argument("--next", required=True)
+    w.add_argument("--repo")
+    w.add_argument("--branch")
+    w.add_argument("--sha")
+    w.add_argument("--footprint", default="")
+    w.add_argument("--gate", default="none")
+    w.add_argument("--gate-ts", default="")
+    w.add_argument("--harness", default="claude")
+    w.add_argument("--cli-version", default="")
+    w.add_argument("--adapter", default="none")
+    w.add_argument("--stop", default="")
+    w.add_argument("--days-lost", default="0")
+    c = sub.add_parser("check")
+    c.add_argument("run_dir")
+    c.add_argument("--repo")
+    c.add_argument("--json", action="store_true")
+    a = p.parse_args(argv)
+    if a.cmd == "write":
+        cmd_write(a)
+        return 0
+    return cmd_check(a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
