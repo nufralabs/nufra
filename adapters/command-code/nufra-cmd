@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+"""nufra-cmd: hand-off adapter for Command Code (M4).
+
+nufra never runs Command Code. It prepares one phase for it, the user starts `cmd` by hand,
+and Claude collects and checks the result. Command Code's terms forbid scripts that "perform
+automated searches or requests" (commandcode.ai/terms, Acceptable Use, 2026-10-29).
+
+prepare RUN_DIR --repo REPO --phase "N <name>" --brief FILE [--allow-mcp a,b]
+    Runs 4 guards. Any guard that fails prints REFUSED and exits 4. Nothing is written then.
+      G1 MCP:    0 MCP servers that Command Code would load (user, local and project scope),
+                 except names given with --allow-mcp.
+      G2 prod:   the brief and handoff hold no prod server names and no forbidden term.
+      G3 gate:   handoff.md has no open gate. Command Code never opens a gate.
+      G4 one:    no other harness holds the pen (lock file) and no Command Code process runs.
+    Then writes REPO/.nufra/cmd-brief.md, the lock RUN_DIR/.pen.json, handoff.md
+    (harness commandcode) and prints what the user types.
+
+collect RUN_DIR --repo REPO
+    Refuses (exit 4) when there is no result, HEAD moved, or a file outside REPO/.nufra changed.
+    Else moves the result to RUN_DIR/cmd-result.md, removes the lock and hands the pen back to
+    Claude in handoff.md.
+
+Stdlib only. No network.
+"""
+import argparse
+import datetime as dt
+import glob
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+HANDOFF_TOOL = os.path.join(HERE, "..", "..", "bin", "nufra-handoff")
+CMD_HOME = os.environ.get("NUFRA_CMD_HOME", os.path.expanduser("~/.commandcode"))
+TERMS = os.environ.get("NUFRA_FORBIDDEN_TERMS", os.path.expanduser("~/.config/nufra/forbidden-terms.txt"))
+PROD_RE = re.compile(r"\b[\w.]*[-_.](?:prod|preprod|production)(?:[-_.][\w.]*)?\b"
+                     r"|\b(?:prod|preprod|production)[-_.][\w.]+\b", re.IGNORECASE)
+WORK = ".nufra"
+REFUSED = 4
+
+
+def refuse(msg):
+    print(f"REFUSED: {msg}")
+    sys.exit(REFUSED)
+
+
+def git(repo, *args):
+    r = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True)
+    if r.returncode != 0:
+        refuse(f"git {' '.join(args)} failed in {repo}")
+    return r.stdout
+
+
+def mcp_servers(repo):
+    """Every MCP server Command Code would load for this repo, with the file it comes from."""
+    files = [os.path.join(CMD_HOME, "mcp.json"), os.path.join(repo, ".mcp.json")]
+    files += glob.glob(os.path.join(CMD_HOME, "projects", "*", "mcp.json"))
+    found = []
+    for path in files:
+        if not os.path.exists(path):
+            continue
+        try:
+            data = json.load(open(path))
+        except ValueError:
+            found.append(("<unreadable>", path))  # fail closed
+            continue
+        servers = data.get("mcpServers", data) if isinstance(data, dict) else {}
+        for name in (servers or {}):
+            found.append((name, path))
+    return found
+
+
+def forbidden_terms():
+    if not os.path.exists(TERMS):
+        return []
+    with open(TERMS) as fh:
+        return [t.strip() for t in fh if t.strip() and not t.startswith("#")]
+
+
+def handoff_fields(run_dir):
+    path = os.path.join(run_dir, "handoff.md")
+    if not os.path.exists(path):
+        refuse(f"no handoff.md in {run_dir}; write one with nufra-handoff first")
+    out = {}
+    for line in open(path).read().splitlines():
+        m = re.match(r"^- ([a-z_ ]+): (.*)$", line)
+        if m:
+            out[m.group(1)] = m.group(2).strip()
+    return out, open(path).read()
+
+
+def command_code_running():
+    """Pids of a running Command Code CLI (npm package `command-code`, binaries `cmd` / `command-code`)."""
+    r = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True)
+    pids = []
+    for line in r.stdout.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) != 2 or int(parts[0]) in (os.getpid(), os.getppid()):
+            continue
+        argv = parts[1].split()
+        names = [os.path.basename(x) for x in argv[:2]]
+        node_pkg = names[0] == "node" and len(argv) > 1 and (
+            "node_modules/command-code/" in argv[1] or names[1] in ("cmd", "command-code"))
+        if names[0] in ("cmd", "command-code") or node_pkg:
+            pids.append(parts[0])
+    return pids
+
+
+def tree_state(repo):
+    """HEAD and the porcelain status of everything outside .nufra/."""
+    head = git(repo, "rev-parse", "HEAD").strip()
+    lines = [l for l in git(repo, "status", "--porcelain", "--untracked-files=all").splitlines()
+             if not l[3:].startswith(WORK + "/")]
+    return head, lines
+
+
+def cmd_prepare(a):
+    run_dir, repo = os.path.abspath(a.run_dir), os.path.abspath(a.repo)
+    if not os.path.isfile(a.brief):
+        refuse(f"no brief file: {a.brief}")
+    brief = open(a.brief).read()
+    fields, handoff_text = handoff_fields(run_dir)
+
+    # G1 MCP
+    allow = {x for x in (a.allow_mcp or "").split(",") if x}
+    bad = [(n, p) for n, p in mcp_servers(repo) if n not in allow]
+    if bad:
+        refuse("G1 MCP: Command Code would load " + ", ".join(f"{n} ({p})" for n, p in bad))
+    # G2 prod names and forbidden terms
+    text = brief + "\n" + handoff_text
+    hits = sorted(set(m.group(0) for m in PROD_RE.finditer(text)))
+    hits += [t for t in forbidden_terms() if re.search(rf"\b{re.escape(t)}\b", text, re.IGNORECASE)]
+    if hits:
+        refuse(f"G2 prod: the brief or handoff names {len(hits)} prod or forbidden item(s); remove them")
+    # G3 gate
+    gate = fields.get("open gate", "")
+    if gate != "none":
+        refuse(f"G3 gate: handoff has open gate '{gate}'. Only Claude and the user close gates")
+    # G4 one agent
+    pen = os.path.join(run_dir, ".pen.json")
+    if os.path.exists(pen):
+        refuse(f"G4 one agent: {json.load(open(pen)).get('harness')} already holds the pen ({pen})")
+    if fields.get("harness", "claude") != "claude":
+        refuse(f"G4 one agent: handoff says {fields.get('harness')} holds the pen")
+    running = command_code_running()
+    if running:
+        refuse(f"G4 one agent: Command Code already runs (pid {', '.join(running)})")
+
+    head, lines = tree_state(repo)
+    os.makedirs(os.path.join(repo, WORK), exist_ok=True)
+    result_rel = f"{WORK}/cmd-result.md"
+    brief_path = os.path.join(repo, WORK, "cmd-brief.md")
+    with open(brief_path, "w") as fh:
+        fh.write(f"# Phase for Command Code: {a.phase}\n\n"
+                 "Rules (from nufra; do not break them):\n"
+                 "- Read only. Do not edit, create or delete any file except the result file below.\n"
+                 "- Do not commit, push, install packages or call MCP tools.\n"
+                 "- Do not approve or close any gate. If a decision is needed, write it as a question.\n"
+                 f"- Write your result to `{result_rel}`: what you found, each claim with a file:line,\n"
+                 "  then 'Open questions'.\n\n"
+                 f"Resume point (handoff.md): phase `{fields.get('phase')}`, branch `{fields.get('branch')}`, "
+                 f"sha `{fields.get('sha')}`.\n\n## Brief\n\n{brief}\n")
+    json.dump({"harness": "commandcode", "phase": a.phase, "head": head,
+               "dirty": hashlib.sha256("\n".join(lines).encode()).hexdigest(),
+               "started": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")},
+              open(pen, "w"), indent=2)
+    subprocess.run([sys.executable, HANDOFF_TOOL, "write", run_dir, "--phase", fields.get("phase", a.phase),
+                    "--next", f"Command Code runs '{a.phase}' by hand; then nufra-cmd collect",
+                    "--repo", repo, "--footprint", os.path.relpath(brief_path, repo), "--harness", "commandcode",
+                    "--cli-version", a.cli_version, "--adapter", os.path.abspath(__file__)],
+                   check=True, capture_output=True)
+    print("Guards: G1 MCP ok, G2 prod ok, G3 gate ok, G4 one agent ok.")
+    print("Now, by hand, in a new Terminal:")
+    print(f"  cd {repo} && cmd")
+    print(f"  then type: Read {WORK}/cmd-brief.md and follow it.")
+    print("Approve only the write to " + result_rel + ". When it is done, close cmd and run collect.")
+    return 0
+
+
+def cmd_collect(a):
+    run_dir, repo = os.path.abspath(a.run_dir), os.path.abspath(a.repo)
+    pen = os.path.join(run_dir, ".pen.json")
+    if not os.path.exists(pen):
+        refuse("no lock: nothing was prepared for Command Code")
+    lock = json.load(open(pen))
+    result = os.path.join(repo, WORK, "cmd-result.md")
+    if not os.path.exists(result) or not open(result).read().strip():
+        refuse(f"no result at {result}")
+    head, lines = tree_state(repo)
+    if head != lock["head"]:
+        refuse(f"HEAD moved from {lock['head'][:12]} to {head[:12]}: Command Code must not commit")
+    if hashlib.sha256("\n".join(lines).encode()).hexdigest() != lock["dirty"]:
+        refuse("files outside .nufra/ changed during the phase: " + "; ".join(lines[:5]))
+    shutil.move(result, os.path.join(run_dir, "cmd-result.md"))
+    shutil.rmtree(os.path.join(repo, WORK), ignore_errors=True)
+    os.remove(pen)
+    fields, _ = handoff_fields(run_dir)
+    subprocess.run([sys.executable, HANDOFF_TOOL, "write", run_dir, "--phase", fields.get("phase", lock["phase"]),
+                    "--next", f"Claude verifies cmd-result.md of '{lock['phase']}' like a subagent reply",
+                    "--repo", repo, "--footprint", os.path.join(run_dir, "cmd-result.md"),
+                    "--harness", "claude", "--cli-version", a.cli_version, "--adapter", "none"],
+                   check=True, capture_output=True)
+    print(f"OK: result in {os.path.join(run_dir, 'cmd-result.md')}. The pen is back with Claude.")
+    return 0
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="nufra-cmd")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    pr = sub.add_parser("prepare")
+    pr.add_argument("run_dir")
+    pr.add_argument("--repo", required=True)
+    pr.add_argument("--phase", required=True)
+    pr.add_argument("--brief", required=True)
+    pr.add_argument("--allow-mcp", default="")
+    pr.add_argument("--cli-version", default="unknown")
+    co = sub.add_parser("collect")
+    co.add_argument("run_dir")
+    co.add_argument("--repo", required=True)
+    co.add_argument("--cli-version", default="unknown")
+    a = p.parse_args(argv)
+    return cmd_prepare(a) if a.cmd == "prepare" else cmd_collect(a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

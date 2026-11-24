@@ -253,7 +253,7 @@ is what lets a later session resume without re-deriving anything.
   phase boundary and at every pause. Any harness must be able to read it, so it is plain markdown with
   these fields: `phase` (last done, next), `branch` and `sha`, `last footprint` (path), `next action`
   (one line), `open gate` (none, 2.5 or 6.5, with the question ts), `harness` (who holds the pen:
-  `claude`, `codex`, `gemini`), `cli_version`, `adapter` (launcher path, or `none`), `written` (date
+  `claude`, `codex`, `gemini`, `commandcode`), `cli_version`, `adapter` (launcher path, or `none`), `written` (date
   and time). Context that is not in a footprint or in `handoff.md` is lost at a stop.
   Write it only with `bin/nufra-handoff write runs/<name> --phase "<N> done, next <M>" --next "<one line>"
   --repo <worktree> --footprint <path> [--gate 2.5 --gate-ts <ts>] [--harness codex --adapter <path>]`.
@@ -383,6 +383,10 @@ it rewrites `runs/<name>/handoff.md` (footprint rule) and appends one row to `ru
 only on the user's command and only at this boundary. Claude Code stays the only coordinator: another
 harness runs a single phase from a brief and `handoff.md`, never opens a gate, and runs only through an
 adapter that passed the guard tests (the 4 guard tests: a prod MCP call fails, network goes only to the model API, a gate stops with no quoted approval, one agent at a time). Source: user ruling, 2026-11-23, and the engineering council (round 1 and round 4).
+Command Code runs only by hand (its terms forbid scripts that make requests): `adapters/command-code/nufra-cmd prepare runs/<name>
+--repo <worktree> --phase "<N> <name>" --brief <file>` runs the guards and prints what the user types; the user
+starts `cmd`; then `adapters/command-code/nufra-cmd collect runs/<name> --repo <worktree>` refuses any change outside `.nufra/`, and
+Claude verifies `cmd-result.md` like a subagent reply. Read-only phases only (investigate, audit).
 
 **"kill your stack"** Stop only what this run started: map port to pid to working directory first, and
 kill by pid. Never a pattern kill, it can take out someone else's process. Leave the fixture ready so a

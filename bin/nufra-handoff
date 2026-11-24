@@ -28,7 +28,7 @@ import tempfile
 
 FIELDS = ("phase", "branch", "sha", "last footprint", "next action", "open gate",
           "harness", "cli_version", "adapter", "written")
-HARNESSES = ("claude", "codex", "gemini")
+HARNESSES = ("claude", "codex", "gemini", "commandcode")
 GATES = ("none", "2.5", "6.5")
 SECRET = re.compile(r"(sk-[A-Za-z0-9_-]{8,}|xox[abprs]-[A-Za-z0-9-]{8,}|gh[pousr]_[A-Za-z0-9]{16,}"
                     r"|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----)")

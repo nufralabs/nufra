@@ -73,7 +73,7 @@ class WriteTests(Base):
         self.assertFalse(os.path.exists(self.handoff))
 
     def test_unknown_harness_refused(self):
-        r = self.write("3 done", "x", "--harness", "commandcode")
+        r = self.write("3 done", "x", "--harness", "cursor")
         self.assertNotEqual(r.returncode, 0)
 
     def test_open_gate_needs_ts(self):
