@@ -42,7 +42,7 @@ Paths are relative to this file. Give subagents the absolute path.
 ## Start of every run
 
 1. **Read `./foreman.config.md`** in the current directory. If it is missing, or the fields this run
-   needs are blank, say so and offer `/master-foreman-setup`. Never fill a blank by guessing. A blank
+   needs are blank, say so and offer `/master-foreman-setup` (in nufra, `nufra-init` writes the first config). Never fill a blank by guessing. A blank
    field the run does not need stays blank.
 2. **Write `runs/<name>/sources.md`:** the local code paths and local database from the config, then
    each extra source handed over for this run, or `extra sources: none`.

@@ -1,0 +1,364 @@
+#!/usr/bin/env python3
+"""nufra init: set up a nufra workspace for one or more local git repos.
+
+Reads each repo (local files only), proposes foreman.config.md with the file each value came from,
+shows the proposal, and writes only after you confirm. Then copies core/ into WORKSPACE/.claude.
+
+Usage:
+  nufra-init [--workspace DIR] REPO [REPO ...] [--yes] [--dry-run]
+
+Rules (from /master-foreman-setup):
+- Propose from evidence. A field with no evidence stays blank; foreman asks about it when a run needs it.
+- Local only. No network, no MCP, nothing is started, stopped or migrated.
+- Secrets never go in the config. Real env files (.env, .env.local) are never opened. Sample env files
+  give variable names, and a URL value only when it points at this machine.
+- Never overwrite. An existing foreman.config.md or .claude file is kept and named (exit 4 for the config).
+- The database commands stay blank: they need a host check against what runs now.
+  Run /master-foreman-setup in the workspace to fill them.
+
+Stdlib only.
+"""
+import argparse
+import glob
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.abspath(os.path.join(HERE, ".."))
+CORE = os.path.join(ROOT, "core")
+REFUSED = 4
+
+LOCKFILES = [  # (file, package manager, install command)
+    ("pnpm-lock.yaml", "pnpm", "pnpm install"),
+    ("yarn.lock", "yarn", "yarn install"),
+    ("bun.lockb", "bun", "bun install"),
+    ("bun.lock", "bun", "bun install"),
+    ("package-lock.json", "npm", "npm ci"),
+    ("uv.lock", "uv", "uv sync"),
+    ("poetry.lock", "poetry", "poetry install"),
+    ("Pipfile.lock", "pipenv", "pipenv install"),
+    ("requirements.txt", "pip", "pip install -r requirements.txt"),
+    ("Cargo.lock", "cargo", "cargo fetch"),
+    ("go.sum", "go", "go mod download"),
+    ("Gemfile.lock", "bundler", "bundle install"),
+    ("composer.lock", "composer", "composer install"),
+]
+MANIFESTS = [("package.json", "node"), ("pyproject.toml", "python"), ("setup.py", "python"),
+             ("requirements.txt", "python"), ("go.mod", "go"), ("Cargo.toml", "rust"), ("Gemfile", "ruby"),
+             ("composer.json", "php"), ("pom.xml", "java (maven)"), ("build.gradle", "java (gradle)"),
+             ("build.gradle.kts", "kotlin (gradle)")]
+NODE_FRAMEWORKS = ["next", "nuxt", "@remix-run/react", "astro", "@sveltejs/kit", "vite", "@nestjs/core",
+                   "express", "fastify", "react", "vue", "svelte"]
+SAMPLE_ENVS = [".env.example", ".env.sample", ".env.template", ".env.dist", "example.env"]
+LOCAL_URL = re.compile(r"^https?://(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(:\d+)?(/\S*)?$")
+DB_IMAGES = [("postgres", "postgres"), ("postgis", "postgres"), ("mysql", "mysql"), ("mariadb", "mariadb"),
+             ("mongo", "mongodb"), ("redis", "redis")]
+CI_WORDS = {"test": re.compile(r"\b(test|pytest|jest|vitest|rspec|go test|cargo test)\b"),
+            "lint": re.compile(r"\b(lint|eslint|ruff|flake8|rubocop|golangci-lint|clippy)\b"),
+            "typecheck": re.compile(r"\b(typecheck|type-check|tsc|mypy|pyright)\b")}
+
+
+def refuse(msg):
+    print(f"REFUSED: {msg}")
+    sys.exit(REFUSED)
+
+
+def git(repo, *args):
+    r = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def read(path):
+    try:
+        with open(path, errors="replace") as fh:
+            return fh.read()
+    except OSError:
+        return ""
+
+
+class Repo:
+    """Proposed values for one repo: field -> (value, source)."""
+
+    FIELDS = ["path", "stack", "package manager", "base branch", "install command", "start command",
+              "stop command", "test command", "lint command", "typecheck command", "end-to-end test folder",
+              "app URL"]
+
+    def __init__(self, path):
+        self.path = path
+        self.name = os.path.basename(path.rstrip("/"))
+        self.v = {}
+        self.db = {}
+        self.env_names = []
+
+    def put(self, field, value, source, store=None):
+        store = self.v if store is None else store
+        if value and field not in store:
+            store[field] = (value, source)
+
+    def rel(self, p):
+        return os.path.relpath(p, self.path)
+
+
+def ci_commands(repo):
+    """run: lines from GitHub Actions and script: lines from GitLab CI, with their file."""
+    out = []
+    for f in sorted(glob.glob(os.path.join(repo.path, ".github", "workflows", "*.y*ml"))):
+        for m in re.finditer(r"^\s*(?:-\s*)?run:\s*(?!\|)(.+)$", read(f), re.M):
+            out.append((m.group(1).strip().strip("'\""), repo.rel(f)))
+    gl = os.path.join(repo.path, ".gitlab-ci.yml")
+    if os.path.exists(gl):
+        for m in re.finditer(r"^\s*-\s+(.+)$", read(gl), re.M):
+            out.append((m.group(1).strip().strip("'\""), ".gitlab-ci.yml"))
+    return out
+
+
+def scan(path):
+    r = Repo(path)
+    r.put("path", path, "argument")
+    files = set(os.listdir(path))
+
+    stacks = [(label, f) for f, label in MANIFESTS if f in files]
+    pkg = {}
+    if "package.json" in files:
+        try:
+            pkg = json.loads(read(os.path.join(path, "package.json")))
+        except ValueError:
+            pkg = {}
+        deps = {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})}
+        fw = [d for d in NODE_FRAMEWORKS if d in deps]
+        ts = "typescript" in deps or "tsconfig.json" in files
+        label = ("typescript" if ts else "javascript") + (f" ({fw[0].split('/')[-1]})" if fw else "")
+        stacks = [(label, "package.json")] + [s for s in stacks if s[1] != "package.json"]
+    if stacks:
+        seen, labels = [], []
+        for label, f in stacks:
+            if label not in labels:
+                labels.append(label)
+                seen.append(f)
+        r.put("stack", ", ".join(labels), ", ".join(seen))
+
+    for f, pm, install in LOCKFILES:
+        if f in files:
+            r.put("package manager", pm, f)
+            r.put("install command", install, f)
+            break
+    if "packageManager" in pkg and "package manager" not in r.v:
+        r.put("package manager", pkg["packageManager"].split("@")[0], "package.json packageManager")
+
+    head = git(path, "symbolic-ref", "--short", "refs/remotes/origin/HEAD")
+    if head:
+        r.put("base branch", head.split("/", 1)[-1], "git origin/HEAD")
+    else:
+        for b in ("main", "master", "develop"):
+            if git(path, "rev-parse", "--verify", "--quiet", f"refs/heads/{b}"):
+                r.put("base branch", b, "local branch (no origin/HEAD)")
+                break
+        current = git(path, "symbolic-ref", "--short", "HEAD")
+        r.put("base branch", current, "current branch (no origin/HEAD, check it)")
+
+    # CI commands first: they are the real gates.
+    for cmd, src in ci_commands(r):
+        for field, rx in CI_WORDS.items():
+            if rx.search(cmd):
+                r.put(f"{field} command", cmd, src)
+    pm = r.v.get("package manager", ("npm", ""))[0]
+    runner = {"npm": "npm run", "pnpm": "pnpm", "yarn": "yarn", "bun": "bun run"}.get(pm, "npm run")
+    scripts = pkg.get("scripts", {}) if isinstance(pkg.get("scripts"), dict) else {}
+    for field, keys in (("test command", ["test", "test:unit"]), ("lint command", ["lint"]),
+                        ("typecheck command", ["typecheck", "type-check", "tsc", "check-types"]),
+                        ("start command", ["dev", "start"])):
+        for k in keys:
+            if k in scripts:
+                r.put(field, f"{runner} {k}", f"package.json scripts.{k}")
+                break
+    if "Makefile" in files:
+        mk = read(os.path.join(path, "Makefile"))
+        for field, target in (("test command", "test"), ("lint command", "lint"), ("start command", "dev"),
+                              ("start command", "run")):
+            if re.search(rf"^{target}:", mk, re.M):
+                r.put(field, f"make {target}", "Makefile")
+    if "pyproject.toml" in files and "pytest" in read(os.path.join(path, "pyproject.toml")):
+        r.put("test command", "pytest", "pyproject.toml")
+    if os.access(os.path.join(path, "bin", "test"), os.X_OK):
+        r.put("test command", "bin/test", "bin/test exists")
+    if "go.mod" in files:
+        r.put("test command", "go test ./...", "go.mod")
+    if "Cargo.toml" in files:
+        r.put("test command", "cargo test", "Cargo.toml")
+
+    compose = [f for f in ("compose.yaml", "compose.yml", "docker-compose.yml", "docker-compose.yaml")
+               if f in files]
+    if compose:
+        r.put("start command", f"docker compose -f {compose[0]} up -d", compose[0])
+        r.put("stop command", f"docker compose -f {compose[0]} down", compose[0])
+        text = read(os.path.join(path, compose[0]))
+        for m in re.finditer(r"^\s*image:\s*['\"]?([\w./-]+)", text, re.M):
+            img = m.group(1).split("/")[-1]
+            for key, engine in DB_IMAGES:
+                if img.startswith(key):
+                    r.put("engine", engine, f"{compose[0]} image {m.group(1)}", r.db)
+    for pattern in ("*.sqlite", "*.sqlite3", "*.db", "db/*.sqlite3", "prisma/*.db"):
+        hits = glob.glob(os.path.join(path, pattern))
+        if hits:
+            r.put("engine", "sqlite", r.rel(hits[0]), r.db)
+    if os.path.exists(os.path.join(path, "supabase", "config.toml")) or os.path.isdir(
+            os.path.join(path, "supabase", "migrations")):
+        r.put("engine", "postgres (supabase local)", "supabase/", r.db)
+        r.put("schema lookup hint", "supabase/migrations", "folder exists", r.db)
+    prisma = os.path.join(path, "prisma", "schema.prisma")
+    if os.path.exists(prisma):
+        m = re.search(r'provider\s*=\s*"(postgresql|mysql|sqlite|mongodb|sqlserver)"', read(prisma))
+        if m:
+            r.put("engine", m.group(1).replace("postgresql", "postgres"), "prisma/schema.prisma", r.db)
+        r.put("schema lookup hint", "prisma/schema.prisma", "file exists", r.db)
+
+    for pattern, label in (("playwright.config.*", "Playwright"), ("cypress.config.*", "Cypress")):
+        if glob.glob(os.path.join(path, pattern)):
+            folder = next((d for d in ("e2e", "tests/e2e", "test/e2e", "cypress/e2e", "playwright")
+                           if os.path.isdir(os.path.join(path, d))), "")
+            r.put("end-to-end test folder", folder or f"see {pattern}", f"{label} config")
+    for d in ("e2e", "tests/e2e", "test/e2e"):
+        if os.path.isdir(os.path.join(path, d)):
+            r.put("end-to-end test folder", d, "folder exists")
+
+    for f in SAMPLE_ENVS:  # never .env itself
+        if f not in files:
+            continue
+        for line in read(os.path.join(path, f)).splitlines():
+            m = re.match(r"^\s*(?:export\s+)?([A-Z][A-Z0-9_]*)\s*=\s*['\"]?([^'\"#\s]*)", line)
+            if not m:
+                continue
+            name, value = m.groups()
+            r.env_names.append(name)
+            if "URL" in name and LOCAL_URL.match(value) and not re.search(r"DB|DATABASE|REDIS|MONGO", name):
+                r.put("app URL", value, f"{f} {name}")
+        break
+    return r
+
+
+def render(project, repos):
+    lines = ["# Foreman config", "",
+             "Written by `nufra init`. A blank field makes foreman ask, never guess.",
+             "Secrets never go here: store the name of an environment variable, not its value.", "",
+             "## Project", "", f"- name: {project}", "- what it does, in one line:",
+             "- words this project uses that an outsider would misread:", "", "## Repos", ""]
+    for r in repos:
+        lines.append(f"### repo: {r.name}")
+        lines.append("")
+        lines += [f"- {f}: {r.v.get(f, ('', ''))[0]}".rstrip() for f in Repo.FIELDS]
+        lines.append("")
+    db = next((r.db for r in repos if r.db), {})
+    lines += ["## Local database", "", "Commands read SQL from stdin and must reach this machine only.", "",
+              f"- engine: {db.get('engine', ('', ''))[0]}".rstrip(), "- read command:",
+              "- write command, test fixtures only:",
+              f"- schema lookup hint: {db.get('schema lookup hint', ('', ''))[0]}".rstrip(), "",
+              "## Test accounts", "", "Names of environment variables, never values.", "", "- login URL:",
+              "- username variable:", "- password variable:", "", "## Known sources", "",
+              "Off by default. Each one is used only when named in a run, by its key.",
+              "Example: `app-logs: /path/to/logs`", "", "- none", "", "## House rules", "",
+              "This company's own engineering rules. They sit on top of the pipeline's rules and win when they "
+              "conflict.", "", "- none", ""]
+    return "\n".join(lines)
+
+
+def proposal(repos):
+    out = []
+    for r in repos:
+        out.append(f"repo: {r.name}")
+        w = max(len(f) for f in Repo.FIELDS)
+        for f in Repo.FIELDS:
+            value, src = r.v.get(f, ("", ""))
+            out.append(f"  {f.ljust(w)}  {value or '(blank)'}" + (f"   <- {src}" if src else ""))
+        for f, (value, src) in r.db.items():
+            out.append(f"  {('db ' + f).ljust(w)}  {value}   <- {src}")
+        if r.env_names:
+            out.append(f"  {'env names'.ljust(w)}  {', '.join(r.env_names[:12])}"
+                       + (" ..." if len(r.env_names) > 12 else "") + "   (names only)")
+    out.append("Database read and write commands stay blank: run /master-foreman-setup to check the host.")
+    return "\n".join(out)
+
+
+def install_core(workspace):
+    """Copy core/ into WORKSPACE/.claude. Never overwrite. Returns (copied, kept)."""
+    plan = [(os.path.join(CORE, "settings.json"), os.path.join(".claude", "settings.json")),
+            (os.path.join(CORE, "mcp.example.json"), "foreman.mcp.json")]
+    for src in glob.glob(os.path.join(CORE, "hooks", "*")):
+        plan.append((src, os.path.join(".claude", "hooks", os.path.basename(src))))
+    wf = os.path.join(CORE, "workflow", "master-foreman")
+    for dirpath, _, names in os.walk(wf):
+        for n in names:
+            if n.endswith(".pyc") or n == ".DS_Store":
+                continue
+            src = os.path.join(dirpath, n)
+            plan.append((src, os.path.join(".claude", "skills", "master-foreman", os.path.relpath(src, wf))))
+    copied, kept = [], []
+    for src, rel in plan:
+        dst = os.path.join(workspace, rel)
+        if os.path.lexists(dst):
+            kept.append(rel)
+            continue
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copy2(src, dst)
+        copied.append(rel)
+    launcher = os.path.join(workspace, "master-foreman")
+    if os.path.lexists(launcher):
+        kept.append("master-foreman")
+    else:
+        os.symlink(os.path.join(ROOT, "bin", "master-foreman"), launcher)
+        copied.append("master-foreman (link)")
+    return copied, kept
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="nufra-init", description="Set up a nufra workspace for local git repos.")
+    p.add_argument("repos", nargs="+", metavar="REPO")
+    p.add_argument("--workspace", default=".")
+    p.add_argument("--project", default="")
+    p.add_argument("--yes", action="store_true", help="write without the confirm prompt")
+    p.add_argument("--dry-run", action="store_true", help="show the proposal, write nothing")
+    a = p.parse_args(argv)
+
+    workspace = os.path.realpath(a.workspace)
+    if workspace == ROOT or workspace.startswith(ROOT + os.sep):
+        refuse("the workspace must be outside the nufra folder")
+    repos = []
+    for path in a.repos:
+        path = os.path.realpath(os.path.expanduser(path))
+        if not os.path.isdir(path):
+            refuse(f"not a folder: {path}")
+        if git(path, "rev-parse", "--show-toplevel") != path:
+            refuse(f"not the top of a git repository: {path}")
+        repos.append(scan(path))
+    config = os.path.join(workspace, "foreman.config.md")
+    if os.path.exists(config):
+        refuse(f"foreman.config.md already exists in {workspace}; edit it or run /master-foreman-setup")
+
+    print(proposal(repos))
+    if a.dry_run:
+        print("Dry run: nothing written.")
+        return 0
+    if not a.yes:
+        if not sys.stdin.isatty():
+            refuse("no terminal to confirm; look at the proposal, then run again with --yes")
+        if input(f"Write foreman.config.md and core/ into {workspace}? [y/N] ").strip().lower() not in ("y", "yes"):
+            print("Nothing written.")
+            return 1
+    os.makedirs(workspace, exist_ok=True)
+    project = a.project or (repos[0].name if len(repos) == 1 else "")
+    with open(config, "x") as fh:
+        fh.write(render(project, repos))
+    copied, kept = install_core(workspace)
+    blanks = sum(1 for r in repos for f in Repo.FIELDS if f not in r.v)
+    print(f"Wrote foreman.config.md: {len(repos)} repo(s), {blanks} repo field(s) blank, database commands blank.")
+    print(f"Copied {len(copied)} file(s) of core/" + (f"; kept {len(kept)} that were there: {', '.join(kept)}"
+                                                      if kept else "") + ".")
+    print(f"Next: cd {os.path.relpath(workspace)} && ./master-foreman, then /master-foreman-setup for the database.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
