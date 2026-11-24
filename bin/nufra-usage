@@ -321,9 +321,36 @@ def line_for(r, days):
         r["harness"], ver, days, tok, lim_s, nw_s)
 
 
+def short_num(n):
+    if n is None:
+        return "—"
+    for size, unit in ((1e9, "B"), (1e6, "M"), (1e3, "K")):
+        if n >= size:
+            return ("%.1f" % (n / size)).rstrip("0").rstrip(".") + unit
+    return str(n)
+
+
+def short_table(results, days):
+    """A narrow table (under 40 columns): harness, tokens, limit. A missing limit is '—', never 0%."""
+    rows = [("harness", "%dd tokens" % days, "limit")]
+    for r in results:
+        if r["status"] != "ok":
+            rows.append((r["harness"], "—", r["status"]))
+            continue
+        lim = r["limit"]
+        if lim:
+            reset = (lim.get("resets_at") or "")[:10]
+            lim_s = "%s%% used" % ("%g" % lim["used_percent"]) + (" to %s" % reset[5:] if reset else "")
+        else:
+            lim_s = "— not on disk"
+        rows.append((r["harness"], short_num(r["tokens_window"]), lim_s))
+    return "\n".join("%-8s %-10s %s" % row for row in rows)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Read-only local usage meter.")
     ap.add_argument("--json", action="store_true", help="print JSON instead of lines")
+    ap.add_argument("--short", action="store_true", help="print a narrow table")
     ap.add_argument("--days", type=int, default=7)
     ap.add_argument("--home", default=os.path.expanduser("~"), help=argparse.SUPPRESS)
     ap.add_argument("--codex-sqlite", action="store_true", help=argparse.SUPPRESS)
@@ -336,6 +363,8 @@ def main(argv=None):
     if a.json:
         print(json.dumps({"generated_at": iso(now), "window_days": a.days,
                           "window_start": iso(cutoff), "harnesses": results}, indent=2))
+    elif a.short:
+        print(short_table(results, a.days))
     else:
         for r in results:
             print(line_for(r, a.days))

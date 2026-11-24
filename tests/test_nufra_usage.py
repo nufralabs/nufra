@@ -127,6 +127,17 @@ class CorvusUsageTest(unittest.TestCase):
         self.assertIsNone(r["limit"])
         self.assertIn("weekly limit: not measured", run(self.home).splitlines()[0])
 
+    def test_short_table(self):
+        make_claude(self.home)
+        make_codex(self.home)
+        out = run(self.home, "--short")
+        lines = out.strip().splitlines()
+        self.assertTrue(all(len(l) <= 40 for l in lines), lines)
+        self.assertRegex(lines[1], r"^claude\s+100\s+— not on disk$")
+        self.assertRegex(lines[2], r"^codex\s+700\s+42% used to 11-27$")
+        self.assertRegex(lines[3], r"^gemini\s+—\s+not configured$")
+        self.assertNotIn("0%", lines[1])
+
     def test_codex_plain_jsonl(self):
         make_codex(self.home)
         r = self.by_name()["codex"]

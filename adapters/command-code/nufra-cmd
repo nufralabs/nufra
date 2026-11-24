@@ -175,7 +175,7 @@ def cmd_prepare(a):
                    check=True, capture_output=True)
     print("Guards: G1 MCP ok, G2 prod ok, G3 gate ok, G4 one agent ok.")
     print("Now, by hand, in a new Terminal:")
-    print(f"  cd {repo} && cmd")
+    print(f"  cd {a.repo} && cmd")
     print(f"  then type: Read {WORK}/cmd-brief.md and follow it.")
     print("Approve only the write to " + result_rel + ". When it is done, close cmd and run collect.")
     return 0

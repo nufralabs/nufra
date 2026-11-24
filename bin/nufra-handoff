@@ -107,6 +107,12 @@ def atomic_write(path, text):
     fsync_dir(folder)
 
 
+def shown(path):
+    """Print a path relative to the current folder when it is inside it (no home folder in the output)."""
+    rel = os.path.relpath(path)
+    return path if rel.startswith("..") else rel
+
+
 def cmd_write(a):
     run_dir = os.path.abspath(a.run_dir)
     if not os.path.isdir(run_dir):
@@ -139,7 +145,7 @@ def cmd_write(a):
             die(f"field '{k}' looks like a secret; name the env variable instead (nothing written)")
     path = os.path.join(run_dir, "handoff.md")
     atomic_write(path, render(os.path.basename(run_dir), values))
-    print(f"wrote {path}")
+    print(f"wrote {shown(path)}")
     if a.stop:
         stops = os.path.join(os.path.dirname(run_dir), "quota-stops.md")
         new = not os.path.exists(stops)
@@ -148,7 +154,7 @@ def cmd_write(a):
                 fh.write("# Quota stops\n\n" + STOPS_HEADER)
             fh.write(f"| {values['written'][:10]} | {os.path.basename(run_dir)} | {a.phase} "
                      f"| {a.stop} | {a.days_lost} |\n")
-        print(f"appended {stops}")
+        print(f"appended {shown(stops)}")
 
 
 def cmd_check(a):
