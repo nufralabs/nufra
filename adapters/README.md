@@ -18,5 +18,6 @@ Rule: an adapter may run only after its guard tests pass, and each test tries a 
     # user: cd <worktree> && cmd, then "Read .nufra/cmd-brief.md and follow it."
     nufra-cmd collect runs/<name> --repo <worktree>
 
+Guard 5 (resume): the brief holds the `nufra-continue` prompt, built only when `nufra-handoff check` says OK.
 `collect` refuses a new commit or any change outside `.nufra/`. Guard tests: `tests/test_nufra_cmd.py`.
 The guard "network only to the model API" does not apply: nufra does not start the process.

@@ -15,7 +15,10 @@ nufra switches a harness only on your command and never rotates accounts.
 - `core/hooks/`, `core/settings.json` the MCP block and settings for a Claude Code workspace
 - `adapters/` one launcher per harness (none yet; see its README for the guard rule)
 - `bin/master-foreman` start Claude Code with only the workspace's MCP servers
-- `bin/nufra-usage` read-only usage meter (local files only, no network)
+- `bin/nufra-usage` read-only usage meter (local files only, no network; `--short` for a narrow table)
+- `bin/nufra-handoff` write and check the resume point (`handoff.md`)
+- `bin/nufra-continue` the continuation prompt for the next agent (only when the resume point is safe), and each agent's resume line. Adapted from Orca, see `NOTICE`
+- `adapters/command-code/nufra-cmd` hand-off to Command Code: guards, the user runs `cmd`, then collect
 - `bin/test` run all tests
 
 ## Test

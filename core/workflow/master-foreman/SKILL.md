@@ -387,6 +387,8 @@ Command Code runs only by hand (its terms forbid scripts that make requests): `a
 --repo <worktree> --phase "<N> <name>" --brief <file>` runs the guards and prints what the user types; the user
 starts `cmd`; then `adapters/command-code/nufra-cmd collect runs/<name> --repo <worktree>` refuses any change outside `.nufra/`, and
 Claude verifies `cmd-result.md` like a subagent reply. Read-only phases only (investigate, audit).
+The brief carries `bin/nufra-continue prompt runs/<name> --repo <worktree>` (adapted from Orca, MIT; it refuses a NOT SAFE
+resume point). To resume the same agent after a reset, use `bin/nufra-continue resume-line <agent> <session-id>`.
 
 **"kill your stack"** Stop only what this run started: map port to pid to working directory first, and
 kill by pid. Never a pattern kill, it can take out someone else's process. Leave the fixture ready so a
