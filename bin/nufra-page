@@ -1,0 +1,362 @@
+#!/usr/bin/env python3
+"""nufra-page: one read-only page on this machine with what waits on you, weekly usage and every run (M6).
+
+Serves http://127.0.0.1:PORT only. Reads runs/*/handoff.md, runs/*/.pen.json, runs/quota-stops.md and
+`nufra-usage --json`. Writes nothing. No JavaScript, no CDN, no network beyond the loopback socket.
+
+Usage:
+  nufra-page [--runs DIR ...] [--port 7401]     serve; /?auto=30 reloads every 30 s (off by default, WCAG 2.2.1)
+  nufra-page [--runs DIR ...] --once            print the page to stdout and exit
+  NUFRA_PAGE_USAGE_JSON=FILE                    read usage from FILE instead of running nufra-usage (tests)
+
+States (each one is colour + shape + word, so colour is never the only signal):
+  waiting  ■  handoff.md has an open gate: a question waits for you
+  working  ●  a lock (.pen.json) says another harness holds the pen
+  paused   ⏸  the last quota stop of the run is at the phase handoff.md points to
+  done     ✓  the next action is "none" or "done"
+  ready    ○  safe to resume; nothing else is known
+  unreadable ! handoff.md is missing a field (run `nufra-handoff check`)
+
+Stdlib only.
+"""
+import argparse
+import datetime as dt
+import html
+import http.server
+import json
+import os
+import re
+import subprocess
+import sys
+import threading
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+USAGE_TOOL = os.path.join(HERE, "nufra-usage")
+HOST = "127.0.0.1"
+USAGE_TTL = 300
+FIELDS = ("phase", "branch", "sha", "last footprint", "next action", "open gate",
+          "harness", "cli_version", "adapter", "written")
+SECRET = re.compile(r"(sk-[A-Za-z0-9_-]{8,}|xox[abprs]-[A-Za-z0-9-]{8,}|gh[pousr]_[A-Za-z0-9]{16,}"
+                    r"|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----)")
+ORDER = {"waiting": 0, "unreadable": 1, "paused": 2, "working": 3, "ready": 4, "done": 5}
+SHAPE = {"waiting": "■", "working": "●", "paused": "⏸", "done": "✓", "ready": "○", "unreadable": "!"}
+HARNESS_NAME = {"claude": "Claude", "codex": "Codex", "gemini": "Gemini", "commandcode": "Command Code"}
+
+FAVICON = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" '
+           'fill="#1F2328"/><path d="M10 42 L25 42 L32 52 L39 42 L54 42" stroke="#d0d7de" stroke-width="6" '
+           'fill="none" stroke-linejoin="round" stroke-linecap="round"/><path d="M32 12 C39 21 40 29 32 36 '
+           'C24 29 25 21 32 12 Z" fill="#C8862A"/></svg>')
+FAVICON_FILE = os.path.join(HERE, "..", "core", "favicon.svg")
+
+
+def clean(text, limit=160):
+    """One safe display string: no secrets, no home path, bounded."""
+    text = SECRET.sub("[hidden]", str(text or ""))
+    text = text.replace(os.path.expanduser("~"), "~")
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def parse_handoff(path):
+    out = {}
+    try:
+        with open(path, errors="replace") as fh:
+            for line in fh:
+                m = re.match(r"^- ([a-z_ ]+): (.*)$", line.rstrip("\n"))
+                if m:
+                    out[m.group(1)] = m.group(2).strip()
+    except OSError:
+        return None
+    return out
+
+
+def last_stops(runs_dir):
+    """run name -> (phase, reason) of its last row in quota-stops.md."""
+    stops = {}
+    try:
+        with open(os.path.join(runs_dir, "quota-stops.md"), errors="replace") as fh:
+            for line in fh:
+                cells = [c.strip() for c in line.strip().strip("|").split("|")]
+                if len(cells) == 5 and cells[0][:4].isdigit():
+                    stops[cells[1]] = (cells[2], cells[3])
+    except OSError:
+        pass
+    return stops
+
+
+def run_state(run_dir, stops):
+    name = os.path.basename(run_dir)
+    f = parse_handoff(os.path.join(run_dir, "handoff.md"))
+    row = {"run": name, "phase": "", "next": "", "harness": "", "written": "", "note": ""}
+    if f is None:
+        return None
+    row.update(phase=f.get("phase", ""), next=f.get("next action", ""), harness=f.get("harness", ""),
+               written=f.get("written", ""))
+    missing = [k for k in FIELDS if k not in f]
+    lock = None
+    try:
+        with open(os.path.join(run_dir, ".pen.json")) as fh:
+            lock = json.load(fh)
+    except (OSError, ValueError):
+        pass
+    gate = f.get("open gate", "none")
+    if missing:
+        row.update(state="unreadable", note="missing: " + ", ".join(missing))
+    elif gate != "none":
+        row.update(state="waiting", note=f"gate {gate.split(' ')[0]}: your answer in the thread")
+    elif lock:
+        row.update(state="working", harness=lock.get("harness", row["harness"]),
+                   note=f"phase {lock.get('phase', '')} since {lock.get('started', '')[11:16]} UTC")
+    elif name in stops and stops[name][0] == row["phase"]:
+        row.update(state="paused", note="stopped: " + stops[name][1])
+    elif re.match(r"^(none|done)\b", row["next"], re.I):
+        row.update(state="done")
+    else:
+        row.update(state="ready")
+    return row
+
+
+def collect_runs(dirs):
+    rows = []
+    for runs_dir in dirs:
+        if not os.path.isdir(runs_dir):
+            continue
+        stops = last_stops(runs_dir)
+        for name in sorted(os.listdir(runs_dir)):
+            path = os.path.join(runs_dir, name)
+            if os.path.isdir(path) and not name.startswith("."):
+                row = run_state(path, stops)
+                if row:
+                    rows.append(row)
+    rows.sort(key=lambda r: (ORDER[r["state"]], r["written"] and -dt.datetime.fromisoformat(
+        r["written"].replace("Z", "+00:00")).timestamp() if _iso_ok(r["written"]) else 0))
+    return rows
+
+
+def _iso_ok(s):
+    try:
+        dt.datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+        return True
+    except ValueError:
+        return False
+
+
+class Usage:
+    """nufra-usage --json, run in the background at most every USAGE_TTL seconds."""
+
+    def __init__(self):
+        self.data, self.at, self.lock, self.busy = None, 0.0, threading.Lock(), False
+
+    def load(self):
+        fixture = os.environ.get("NUFRA_PAGE_USAGE_JSON")
+        try:
+            if fixture:
+                with open(fixture) as fh:
+                    return json.load(fh)
+            r = subprocess.run([sys.executable, USAGE_TOOL, "--json"], capture_output=True, text=True,
+                               timeout=60)
+            return json.loads(r.stdout)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return {"error": True}
+
+    def refresh(self):
+        data = self.load()
+        with self.lock:
+            self.data, self.at, self.busy = data, time.time(), False
+
+    def get(self, wait=False):
+        with self.lock:
+            stale = time.time() - self.at > USAGE_TTL
+            start = stale and not self.busy
+            if start:
+                self.busy = True
+        if start:
+            if wait:
+                self.refresh()
+            else:
+                threading.Thread(target=self.refresh, daemon=True).start()
+        return self.data
+
+
+def usage_cards(data):
+    if data is None:
+        return '<p class="muted">Reading usage…</p>'
+    if data.get("error"):
+        return '<p class="muted">Usage: nufra-usage did not answer.</p>'
+    cards = []
+    for h in data.get("harnesses", []):
+        name = HARNESS_NAME.get(h.get("harness"), clean(h.get("harness"), 20))
+        lim = h.get("limit") or {}
+        pct = lim.get("used_percent")
+        stale, said = False, ""
+        if h.get("status") not in ("ok", None):
+            value, bar, sub = "—", 0, "not on this machine"
+        elif pct is None:
+            value, bar, sub = "—", 0, "limit not on disk"
+        else:
+            value, bar, said = f"{pct:.0f}%", max(0, min(100, pct)), f"{pct:.0f}% used"
+            asof = str(lim.get("timestamp") or "")[:10]
+            reset = str(lim.get("resets_at") or "")[:10]
+            sub = f"as of {asof}" + (f", resets {reset}" if reset else "")
+            try:
+                age = (dt.date.today() - dt.date.fromisoformat(asof)).days
+            except ValueError:
+                age = 0
+            if age > 2:
+                value, stale = f"{pct:.0f}%?", True
+                sub = f"old: last seen {age} days ago" + (f", resets {reset}" if reset else "")
+                said = f"{pct:.0f}% used, stale, last seen {age} days ago"
+        said = said or sub
+        tokens = h.get("tokens_window") or 0
+        if tokens:
+            sub += f" · {tokens / 1e6:,.0f}M tokens in 7 days"
+        level = "hi" if isinstance(pct, (int, float)) and pct >= 80 else ""
+        cards.append(
+            f'<div class="card"><div class="cardtop"><span>{html.escape(name)}</span>'
+            f'<b>{html.escape(value)}</b></div>'
+            f'<div class="meter" role="img" aria-label="{html.escape(name)}: {html.escape(said)}">'
+            f'<i class="{level}{" stale" if stale else ""}" style="width:{bar:.0f}%"></i></div>'
+            f'<small>{html.escape(clean(sub, 80))}</small></div>')
+    return '<div class="cards">' + "".join(cards) + "</div>" if cards else '<p class="muted">No harness found.</p>'
+
+
+def chip(state):
+    return f'<span class="chip {state}"><span aria-hidden="true">{SHAPE[state]}</span> {state}</span>'
+
+
+def render(rows, usage, now=None, auto=False):
+    now = now or dt.datetime.now().astimezone()
+    waiting = [r for r in rows if r["state"] == "waiting"]
+    e = lambda s, n=160: html.escape(clean(s, n))
+    if waiting:
+        items = "".join(f"<li><b>{e(r['run'], 60)}</b> · {e(r['note'])}</li>" for r in waiting)
+        top = f'<section class="wait" aria-label="Waiting on you"><h2><span aria-hidden="true">■</span> Waiting on you ({len(waiting)})</h2>' \
+              f'<ul>{items}</ul></section>'
+    else:
+        top = '<section class="calm" aria-label="Waiting on you"><h2><span aria-hidden="true">○</span> Nothing waits on you</h2></section>'
+    if rows:
+        body = "".join(
+            f"<tr><td>{e(r['run'], 60)}</td><td>{chip(r['state'])}</td>"
+            f"<td>{e(HARNESS_NAME.get(r['harness'], r['harness']), 20)}</td><td>{e(r['phase'], 60)}</td>"
+            f"<td>{e(r['note'] or r['next'])}</td></tr>" for r in rows)
+        table = ('<div class="scroll" tabindex="0" role="region" aria-label="Runs"><table><thead><tr><th scope="col">Run</th><th scope="col">State</th>'
+                 '<th scope="col">Tool</th><th scope="col">Phase</th><th scope="col">Next</th></tr></thead>'
+                 f'<tbody>{body}</tbody></table></div>')
+    else:
+        table = '<p class="muted">No runs with a handoff.md yet.</p>'
+    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">{'<meta http-equiv="refresh" content="30">' if auto else ''}
+<title>nufra</title><link rel="icon" href="/favicon.svg" type="image/svg+xml"><style>{CSS}</style></head>
+<body><main><header><h1>nufra</h1><p class="muted">Read only · this machine · updated
+<time datetime="{now.isoformat(timespec='seconds')}">{now.strftime('%H:%M')}</time> ·
+{'<a href="/">Stop auto-reload</a>' if auto else '<a href="/">Reload</a> · <a href="/?auto=30">Auto-reload every 30 s</a>'}</p></header>
+{top}<h2>Usage this week</h2>{usage_cards(usage)}<h2>Runs</h2>{table}
+<footer class="muted">You answer in Slack or the terminal. This page never changes anything.</footer>
+</main></body></html>"""
+
+
+CSS = """
+:root{--bg:#F6F8FA;--panel:#fff;--ink:#1F2328;--muted:#57606a;--line:#d0d7de;--teal:#0b5f79;--teal-bg:#DDEEF4;
+--red:#8f2b2b;--red-bg:#F7E1E1;--amber:#7a5200;--amber-bg:#FFF1D6;--green:#1d6b40;--green-bg:#E3F2EA;--seed:#C8862A;--seed-bar:#9a5f0f}
+@media (prefers-color-scheme:dark){:root{--bg:#14181c;--panel:#1F2328;--ink:#e6edf3;--muted:#9da7b1;--line:#30363d;
+--teal:#7cc4dc;--teal-bg:#12313b;--red:#f2a3a3;--red-bg:#3a1d1d;--amber:#e8bf6a;--amber-bg:#3a2d12;--green:#8fd4a9;
+--green-bg:#16301f;--seed-bar:#C8862A}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);
+font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif}
+main{max-width:960px;margin:0 auto;padding:24px 16px 40px}header{display:flex;justify-content:space-between;
+align-items:baseline;flex-wrap:wrap;gap:8px}h1{font-size:22px;margin:0;letter-spacing:-.01em}
+h2{font-size:16px;margin:28px 0 10px}.muted{color:var(--muted);margin:0}
+.wait,.calm{border-radius:10px;padding:12px 16px;margin-top:18px;border:2px solid}
+.wait{border-color:var(--red);background:var(--red-bg)}.calm{border-color:var(--line);background:var(--panel)}
+.wait h2,.calm h2{margin:0}.wait ul{margin:6px 0 0;padding-left:20px}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px 14px}
+.cardtop{display:flex;justify-content:space-between}.meter{height:8px;border-radius:4px;background:var(--line);
+margin:8px 0 6px;overflow:hidden}.meter i{display:block;height:100%;background:var(--teal)}
+.meter i.hi{background:var(--seed-bar)}.meter i.stale{opacity:.5}small{color:var(--muted);font-size:13px}
+.scroll:focus-visible,a:focus-visible{outline:2px solid var(--teal);outline-offset:2px}
+a{color:var(--teal)}
+@media (max-width:600px){td:nth-child(3),th:nth-child(3){display:none}}
+.scroll{overflow-x:auto;background:var(--panel);border:1px solid var(--line);border-radius:10px}
+table{width:100%;border-collapse:collapse;min-width:560px}th,td{text-align:left;padding:9px 12px;
+border-bottom:1px solid var(--line);vertical-align:top}th{font-size:13px;color:var(--muted);font-weight:600}
+tr:last-child td{border-bottom:0}.chip{display:inline-block;white-space:nowrap;border:1.5px solid;border-radius:6px;
+padding:0 7px;font-size:13px}.waiting{color:var(--red);background:var(--red-bg)}
+.paused{color:var(--amber);background:var(--amber-bg)}.working{color:var(--teal);background:var(--teal-bg)}
+.done{color:var(--green);background:var(--green-bg)}.ready{color:var(--muted)}
+.unreadable{color:var(--red)}footer.muted{margin-top:24px;font-size:13px}
+"""
+
+
+def favicon():
+    try:
+        with open(FAVICON_FILE) as fh:
+            return fh.read()
+    except OSError:
+        return FAVICON
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    server_version = "nufra-page"
+    sys_version = ""
+
+    def log_message(self, *args):
+        pass  # nothing logged, nothing written
+
+    def send(self, code, body, ctype="text/html; charset=utf-8"):
+        data = body.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; img-src 'self'")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(data)
+
+    def do_GET(self):
+        host = (self.headers.get("Host") or "").rsplit(":", 1)[0]
+        if host not in ("127.0.0.1", "localhost"):
+            return self.send(421, "wrong host\n", "text/plain")  # blocks DNS rebinding
+        path, _, query = self.path.partition("?")
+        if path == "/":
+            return self.send(200, render(collect_runs(self.server.runs), self.server.usage.get(),
+                                         auto=query == "auto=30"))
+        if path == "/favicon.svg":
+            return self.send(200, favicon(), "image/svg+xml")
+        return self.send(404, "not found\n", "text/plain")
+
+    do_HEAD = do_GET
+
+    def refuse(self):
+        self.send(405, "read only\n", "text/plain")
+
+    do_POST = do_PUT = do_DELETE = do_PATCH = refuse
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="nufra-page")
+    p.add_argument("--runs", action="append", help="a runs/ folder (default ./runs); repeat for more")
+    p.add_argument("--port", type=int, default=7401)
+    p.add_argument("--once", action="store_true", help="print the page and exit")
+    a = p.parse_args(argv)
+    runs = [os.path.abspath(os.path.expanduser(d)) for d in (a.runs or ["runs"])]
+    usage = Usage()
+    if a.once:
+        sys.stdout.write(render(collect_runs(runs), usage.get(wait=True)))
+        return 0
+    srv = http.server.ThreadingHTTPServer((HOST, a.port), Handler)
+    srv.runs, srv.usage = runs, usage
+    usage.get()
+    print(f"nufra page: http://{HOST}:{srv.server_address[1]}  (read only; Ctrl-C to stop)", flush=True)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
