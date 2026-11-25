@@ -13,6 +13,7 @@ Usage:
                                                 exists, only sessions with an open window show (like the Slack Home
                                                 tab); a new session shows on the next reload. Only those three files
                                                 are read; nothing else in DIR (never a token file).
+  NUFRA_SLACK_URL=https://NAME.slack.com         adds "Open thread" links to the Slack sessions
   NUFRA_PAGE_USAGE_JSON=FILE                    read usage from FILE instead of running nufra-usage (tests)
 
 States (each one is colour + shape + word, so colour is never the only signal):
@@ -50,6 +51,9 @@ SHAPE = {"waiting": "■", "working": "●", "paused": "⏸", "done": "✓", "re
 SESSION_DAYS = 7      # a session not done shows for 7 days after its last step
 DONE_HOURS = 24       # a done session shows for 24 hours
 SESSION_MAX = 30
+SLACK_URL = re.compile(r"^https://[a-z0-9-]+\.(enterprise\.)?slack\.com$")
+SLACK_ID = re.compile(r"^[A-Z0-9]+$")
+SLACK_TS = re.compile(r"^\d+\.\d+$")
 HARNESS_NAME = {"claude": "Claude", "codex": "Codex", "gemini": "Gemini", "commandcode": "Command Code"}
 
 FAVICON = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" '
@@ -183,7 +187,10 @@ def collect_sessions(sdir, now=None):
         if windows is None and age > (DONE_HOURS * 3600 if state == "done" else SESSION_DAYS * 86400):
             continue
         step = str(pr.get("step") or "")
-        rows.append({"workspace": m.get("workspace") or "?", "state": state, "step": step if re.fullmatch(
+        channel, _, thread = key.partition(":")
+        q = str(pr.get("question_ts") or "") if state == "waiting" else ""
+        rows.append({"channel": channel, "thread": thread, "question": q,
+                     "workspace": m.get("workspace") or "?", "state": state, "step": step if re.fullmatch(
             r"\d+/\d+", step) else "", "text": pr.get("text", ""), "topic": m.get("topic", ""),
             "cli": m.get("cli", ""), "at": at, "age": age})
     rows.sort(key=lambda r: (ORDER[r["state"]], -r["at"]))
@@ -284,7 +291,28 @@ def chip(state):
     return f'<span class="chip {state}"><span aria-hidden="true">{SHAPE[state]}</span> {state}</span>'
 
 
-def session_list(sessions, e):
+def thread_link(base, channel, thread, msg=None):
+    """Slack permalink, or "" when any part does not look like Slack's own format."""
+    msg = msg or thread
+    if not (base and SLACK_URL.match(base) and SLACK_ID.match(channel or "") and SLACK_TS.match(thread or "")
+            and SLACK_TS.match(msg)):
+        return ""
+    return f"{base}/archives/{channel}/p{msg.replace('.', '')}?thread_ts={thread}&cid={channel}"
+
+
+def links(r, base):
+    out = []
+    q = thread_link(base, r["channel"], r["thread"], r["question"]) if r["question"] else ""
+    if q:
+        out.append(f'<a href="{html.escape(q)}" rel="noreferrer">Open the question</a>')
+    t = thread_link(base, r["channel"], r["thread"])
+    if t:
+        out.append(f'<a href="{html.escape(t)}" rel="noreferrer">Open thread <span aria-hidden="true">→</span>'
+                   f'<span class="sr"> for {html.escape(clean(r["workspace"], 40))}</span></a>')
+    return f'<div class="links">{" · ".join(out)}</div>' if out else ""
+
+
+def session_list(sessions, e, base=None):
     if not sessions:
         return '<p class="muted">No open Slack session.</p>'
     items = []
@@ -298,19 +326,23 @@ def session_list(sessions, e):
         items.append(
             f'<li class="sess"><div class="shead"><b>{e(r["workspace"], 40)}</b> {chip(r["state"])} {step}'
             f'<small class="when">{e(HARNESS_NAME.get(r["cli"], r["cli"]), 20)} · {ago(r["age"])}</small></div>'
-            f'<div>{e(r["text"])}</div><small class="topic">{e(r["topic"], 120)}</small></li>')
+            f'<div>{e(r["text"])}</div><small class="topic">{e(r["topic"], 120)}</small>{links(r, base)}</li>')
     return f'<ul class="sessions" aria-label="Slack sessions">{"".join(items)}</ul>'
 
 
-def render(rows, usage, now=None, auto=False, sessions=None):
+def render(rows, usage, now=None, auto=False, sessions=None, slack_url=None):
     now = now or dt.datetime.now().astimezone()
     sessions_on = sessions is not None
     sessions = sessions or []
     e = lambda s, n=160: html.escape(clean(s, n))
     waiting = [{"run": r["run"], "note": r["note"]} for r in rows if r["state"] == "waiting"] + [
-        {"run": r["workspace"], "note": r["text"]} for r in sessions if r["state"] == "waiting"]
+        {"run": r["workspace"], "note": r["text"], "link": thread_link(slack_url, r["channel"], r["thread"],
+                                                                      r["question"] or None)}
+        for r in sessions if r["state"] == "waiting"]
     if waiting:
-        items = "".join(f"<li><b>{e(r['run'], 60)}</b> · {e(r['note'])}</li>" for r in waiting)
+        items = "".join(f"<li><b>{e(r['run'], 60)}</b> · {e(r['note'])}" + (
+            f' · <a href="{html.escape(r["link"])}" rel="noreferrer">Open</a>' if r.get("link") else "") + "</li>"
+            for r in waiting)
         top = f'<section class="wait" aria-label="Waiting on you"><h2><span aria-hidden="true">■</span> Waiting on you ({len(waiting)})</h2>' \
               f'<ul>{items}</ul></section>'
     else:
@@ -331,7 +363,7 @@ def render(rows, usage, now=None, auto=False, sessions=None):
 <body><main><header><h1>nufra</h1><p class="muted">Read only · this machine · updated
 <time datetime="{now.isoformat(timespec='seconds')}">{now.strftime('%H:%M')}</time> ·
 {'<a href="/">Stop auto-reload</a>' if auto else '<a href="/">Reload</a> · <a href="/?auto=30">Auto-reload every 30 s</a>'}</p></header>
-{top}{"<h2>Slack sessions</h2>" + session_list(sessions, e) if sessions_on else ""}<h2>Usage this week</h2>{usage_cards(usage)}<h2>Runs</h2>{table}
+{top}{"<h2>Slack sessions</h2>" + session_list(sessions, e, slack_url) if sessions_on else ""}<h2>Usage this week</h2>{usage_cards(usage)}<h2>Runs</h2>{table}
 <footer class="muted">You answer in Slack or the terminal. This page never changes anything.</footer>
 </main></body></html>"""
 
@@ -370,7 +402,8 @@ padding:0 7px;font-size:13px}.waiting{color:var(--red);background:var(--red-bg)}
 .sess{padding:10px 14px;border-bottom:1px solid var(--line)}.sess:last-child{border-bottom:0}
 .shead{display:flex;flex-wrap:wrap;align-items:center;gap:8px}.shead>.when{margin-left:auto}.topic{display:block}
 .rail{display:inline-flex;gap:2px;vertical-align:middle}.rail i{width:10px;height:10px;border-radius:2px;
-background:var(--line)}.rail i.on{background:var(--green)}footer.muted{margin-top:24px;font-size:13px}
+background:var(--line)}.links{margin-top:4px;font-size:14px}.links a{display:inline-block;padding:4px 0;min-height:24px}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}.rail i.on{background:var(--green)}footer.muted{margin-top:24px;font-size:13px}
 """
 
 
@@ -410,7 +443,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/":
             sessions = collect_sessions(self.server.sessions) if self.server.sessions else None
             return self.send(200, render(collect_runs(self.server.runs), self.server.usage.get(),
-                                         auto=query == "auto=30", sessions=sessions))
+                                         auto=query == "auto=30", sessions=sessions,
+                                         slack_url=self.server.slack_url))
         if path == "/favicon.svg":
             return self.send(200, favicon(), "image/svg+xml")
         return self.send(404, "not found\n", "text/plain")
@@ -433,13 +467,14 @@ def main(argv=None):
     a = p.parse_args(argv)
     runs = [os.path.abspath(os.path.expanduser(d)) for d in (a.runs or ["runs"])]
     sdir = os.path.abspath(os.path.expanduser(a.sessions)) if a.sessions else None
+    slack_url = (os.environ.get("NUFRA_SLACK_URL") or "").rstrip("/") or None
     usage = Usage()
     if a.once:
         sys.stdout.write(render(collect_runs(runs), usage.get(wait=True),
-                                sessions=collect_sessions(sdir) if sdir else None))
+                                sessions=collect_sessions(sdir) if sdir else None, slack_url=slack_url))
         return 0
     srv = http.server.ThreadingHTTPServer((HOST, a.port), Handler)
-    srv.runs, srv.usage, srv.sessions = runs, usage, sdir
+    srv.runs, srv.usage, srv.sessions, srv.slack_url = runs, usage, sdir, slack_url
     usage.get()
     print(f"nufra page: http://{HOST}:{srv.server_address[1]}  (read only; Ctrl-C to stop)", flush=True)
     try:

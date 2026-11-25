@@ -141,7 +141,8 @@ class Sessions(Base):
                    "C1:3.3": {"workspace": "old", "cli": "claude", "topic": "closed window"}},
                   open(os.path.join(d, "sessions.json"), "w"))
         json.dump({"C1:1.1": {"text": "Phase 3: reproducing", "at": now - 30, "state": "working", "step": "3/7"},
-                   "C1:2.2": {"text": "Waiting for you: pick 1 or 2", "at": now - 600, "state": "waiting"},
+                   "C1:2.2": {"text": "Waiting for you: pick 1 or 2", "at": now - 600, "state": "waiting",
+                              "question_ts": "2.5"},
                    "C1:3.3": {"text": "Done", "at": now - 60, "state": "done"}},
                   open(os.path.join(d, "progress.json"), "w"))
         if windows:
@@ -168,6 +169,18 @@ class Sessions(Base):
     def test_without_windows_file_uses_age(self):
         page = self.page(self.write_sessions(windows=False))
         self.assertIn("closed window", page)                   # done 1 min ago: inside 24 h
+
+    def test_thread_links(self):
+        d = self.write_sessions()
+        self.env["NUFRA_SLACK_URL"] = "https://team.slack.com"
+        page = self.page(d)
+        self.assertIn('href="https://team.slack.com/archives/C1/p11?thread_ts=1.1&amp;cid=C1"', page)
+        self.assertIn('href="https://team.slack.com/archives/C1/p25?thread_ts=2.2&amp;cid=C1"', page)  # the question
+        self.assertIn("Open the question", page)
+        self.env["NUFRA_SLACK_URL"] = "https://evil.example"
+        self.assertNotIn("Open thread", self.page(d))           # only a slack.com address makes links
+        del self.env["NUFRA_SLACK_URL"]
+        self.assertNotIn("Open thread", self.page(d))
 
     def test_off_by_default(self):
         self.assertNotIn("Slack sessions", self.once())
