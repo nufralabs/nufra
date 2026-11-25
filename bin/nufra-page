@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
 """nufra-page: one read-only page on this machine with what waits on you, weekly usage and every run (M6).
 
-Serves http://127.0.0.1:PORT only. Reads runs/*/handoff.md, runs/*/.pen.json, runs/quota-stops.md and
-`nufra-usage --json`. Writes nothing. No JavaScript, no CDN, no network beyond the loopback socket.
+Serves http://127.0.0.1:PORT only. Reads runs/*/handoff.md, runs/*/.pen.json, runs/quota-stops.md,
+`nufra-usage --json` and, with --sessions, a Slack listener's sessions.json, progress.json and windows.json.
+Writes nothing. No JavaScript, no CDN, no network beyond the loopback socket.
 
 Usage:
   nufra-page [--runs DIR ...] [--port 7401]     serve; /?auto=30 reloads every 30 s (off by default, WCAG 2.2.1)
   nufra-page [--runs DIR ...] --once            print the page to stdout and exit
+  --sessions DIR (or NUFRA_SESSIONS=DIR)        also list Slack sessions from DIR/sessions.json, DIR/progress.json
+                                                and DIR/windows.json, keyed "channel:thread_ts". When windows.json
+                                                exists, only sessions with an open window show (like the Slack Home
+                                                tab); a new session shows on the next reload. Only those three files
+                                                are read; nothing else in DIR (never a token file).
   NUFRA_PAGE_USAGE_JSON=FILE                    read usage from FILE instead of running nufra-usage (tests)
 
 States (each one is colour + shape + word, so colour is never the only signal):
@@ -39,8 +45,11 @@ FIELDS = ("phase", "branch", "sha", "last footprint", "next action", "open gate"
           "harness", "cli_version", "adapter", "written")
 SECRET = re.compile(r"(sk-[A-Za-z0-9_-]{8,}|xox[abprs]-[A-Za-z0-9-]{8,}|gh[pousr]_[A-Za-z0-9]{16,}"
                     r"|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----)")
-ORDER = {"waiting": 0, "unreadable": 1, "paused": 2, "working": 3, "ready": 4, "done": 5}
-SHAPE = {"waiting": "■", "working": "●", "paused": "⏸", "done": "✓", "ready": "○", "unreadable": "!"}
+ORDER = {"waiting": 0, "blocked": 1, "unreadable": 1, "paused": 2, "working": 3, "ready": 4, "done": 5}
+SHAPE = {"waiting": "■", "working": "●", "paused": "⏸", "done": "✓", "ready": "○", "unreadable": "!", "blocked": "▲"}
+SESSION_DAYS = 7      # a session not done shows for 7 days after its last step
+DONE_HOURS = 24       # a done session shows for 24 hours
+SESSION_MAX = 30
 HARNESS_NAME = {"claude": "Claude", "codex": "Codex", "gemini": "Gemini", "commandcode": "Command Code"}
 
 FAVICON = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" '
@@ -141,6 +150,57 @@ def _iso_ok(s):
         return False
 
 
+def _load_json(path):
+    try:
+        with open(path) as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def collect_sessions(sdir, now=None):
+    """Slack sessions from DIR/sessions.json + DIR/progress.json, newest first. Never reads another file."""
+    if not sdir:
+        return []
+    now = now or time.time()
+    meta = _load_json(os.path.join(sdir, "sessions.json"))
+    prog = _load_json(os.path.join(sdir, "progress.json"))
+    windows = _load_json(os.path.join(sdir, "windows.json")) if os.path.exists(
+        os.path.join(sdir, "windows.json")) else None
+    rows = []
+    for key in (windows if windows is not None else set(meta) | set(prog)):
+        m, pr = meta.get(key) or {}, prog.get(key) or {}
+        if not isinstance(m, dict) or not isinstance(pr, dict):
+            continue
+        pr = pr or {"text": "no status yet", "state": "working"}
+        state = pr.get("state") if pr.get("state") in SHAPE else "working"
+        try:
+            at = float(pr.get("at") or 0)
+        except (TypeError, ValueError):
+            at = 0.0
+        age = now - at
+        if windows is None and age > (DONE_HOURS * 3600 if state == "done" else SESSION_DAYS * 86400):
+            continue
+        step = str(pr.get("step") or "")
+        rows.append({"workspace": m.get("workspace") or "?", "state": state, "step": step if re.fullmatch(
+            r"\d+/\d+", step) else "", "text": pr.get("text", ""), "topic": m.get("topic", ""),
+            "cli": m.get("cli", ""), "at": at, "age": age})
+    rows.sort(key=lambda r: (ORDER[r["state"]], -r["at"]))
+    return rows[:SESSION_MAX]
+
+
+def ago(sec):
+    sec = max(0, int(sec))
+    if sec < 90:
+        return "just now"
+    if sec < 5400:
+        return f"{sec // 60} min ago"
+    if sec < 172800:
+        return f"{sec // 3600} h ago"
+    return f"{sec // 86400} days ago"
+
+
 class Usage:
     """nufra-usage --json, run in the background at most every USAGE_TTL seconds."""
 
@@ -224,10 +284,31 @@ def chip(state):
     return f'<span class="chip {state}"><span aria-hidden="true">{SHAPE[state]}</span> {state}</span>'
 
 
-def render(rows, usage, now=None, auto=False):
+def session_list(sessions, e):
+    if not sessions:
+        return '<p class="muted">No open Slack session.</p>'
+    items = []
+    for r in sessions:
+        step = ""
+        if r["step"]:
+            n, m = (int(x) for x in r["step"].split("/"))
+            step = (f'<span class="rail" role="img" aria-label="step {n} of {m}">'
+                    + "".join(f'<i class="{"on" if i < n else ""}"></i>' for i in range(min(m, 12)))
+                    + f'</span> <small>{n}/{m}</small>')
+        items.append(
+            f'<li class="sess"><div class="shead"><b>{e(r["workspace"], 40)}</b> {chip(r["state"])} {step}'
+            f'<small class="when">{e(HARNESS_NAME.get(r["cli"], r["cli"]), 20)} · {ago(r["age"])}</small></div>'
+            f'<div>{e(r["text"])}</div><small class="topic">{e(r["topic"], 120)}</small></li>')
+    return f'<ul class="sessions" aria-label="Slack sessions">{"".join(items)}</ul>'
+
+
+def render(rows, usage, now=None, auto=False, sessions=None):
     now = now or dt.datetime.now().astimezone()
-    waiting = [r for r in rows if r["state"] == "waiting"]
+    sessions_on = sessions is not None
+    sessions = sessions or []
     e = lambda s, n=160: html.escape(clean(s, n))
+    waiting = [{"run": r["run"], "note": r["note"]} for r in rows if r["state"] == "waiting"] + [
+        {"run": r["workspace"], "note": r["text"]} for r in sessions if r["state"] == "waiting"]
     if waiting:
         items = "".join(f"<li><b>{e(r['run'], 60)}</b> · {e(r['note'])}</li>" for r in waiting)
         top = f'<section class="wait" aria-label="Waiting on you"><h2><span aria-hidden="true">■</span> Waiting on you ({len(waiting)})</h2>' \
@@ -250,7 +331,7 @@ def render(rows, usage, now=None, auto=False):
 <body><main><header><h1>nufra</h1><p class="muted">Read only · this machine · updated
 <time datetime="{now.isoformat(timespec='seconds')}">{now.strftime('%H:%M')}</time> ·
 {'<a href="/">Stop auto-reload</a>' if auto else '<a href="/">Reload</a> · <a href="/?auto=30">Auto-reload every 30 s</a>'}</p></header>
-{top}<h2>Usage this week</h2>{usage_cards(usage)}<h2>Runs</h2>{table}
+{top}{"<h2>Slack sessions</h2>" + session_list(sessions, e) if sessions_on else ""}<h2>Usage this week</h2>{usage_cards(usage)}<h2>Runs</h2>{table}
 <footer class="muted">You answer in Slack or the terminal. This page never changes anything.</footer>
 </main></body></html>"""
 
@@ -284,7 +365,12 @@ tr:last-child td{border-bottom:0}.chip{display:inline-block;white-space:nowrap;b
 padding:0 7px;font-size:13px}.waiting{color:var(--red);background:var(--red-bg)}
 .paused{color:var(--amber);background:var(--amber-bg)}.working{color:var(--teal);background:var(--teal-bg)}
 .done{color:var(--green);background:var(--green-bg)}.ready{color:var(--muted)}
-.unreadable{color:var(--red)}footer.muted{margin-top:24px;font-size:13px}
+.unreadable,.blocked{color:var(--red)}
+.sessions{list-style:none;margin:0;padding:0;background:var(--panel);border:1px solid var(--line);border-radius:10px}
+.sess{padding:10px 14px;border-bottom:1px solid var(--line)}.sess:last-child{border-bottom:0}
+.shead{display:flex;flex-wrap:wrap;align-items:center;gap:8px}.shead>.when{margin-left:auto}.topic{display:block}
+.rail{display:inline-flex;gap:2px;vertical-align:middle}.rail i{width:10px;height:10px;border-radius:2px;
+background:var(--line)}.rail i.on{background:var(--green)}footer.muted{margin-top:24px;font-size:13px}
 """
 
 
@@ -322,8 +408,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.send(421, "wrong host\n", "text/plain")  # blocks DNS rebinding
         path, _, query = self.path.partition("?")
         if path == "/":
+            sessions = collect_sessions(self.server.sessions) if self.server.sessions else None
             return self.send(200, render(collect_runs(self.server.runs), self.server.usage.get(),
-                                         auto=query == "auto=30"))
+                                         auto=query == "auto=30", sessions=sessions))
         if path == "/favicon.svg":
             return self.send(200, favicon(), "image/svg+xml")
         return self.send(404, "not found\n", "text/plain")
@@ -341,14 +428,18 @@ def main(argv=None):
     p.add_argument("--runs", action="append", help="a runs/ folder (default ./runs); repeat for more")
     p.add_argument("--port", type=int, default=7401)
     p.add_argument("--once", action="store_true", help="print the page and exit")
+    p.add_argument("--sessions", default=os.environ.get("NUFRA_SESSIONS"),
+                   help="folder with a Slack listener's sessions.json and progress.json")
     a = p.parse_args(argv)
     runs = [os.path.abspath(os.path.expanduser(d)) for d in (a.runs or ["runs"])]
+    sdir = os.path.abspath(os.path.expanduser(a.sessions)) if a.sessions else None
     usage = Usage()
     if a.once:
-        sys.stdout.write(render(collect_runs(runs), usage.get(wait=True)))
+        sys.stdout.write(render(collect_runs(runs), usage.get(wait=True),
+                                sessions=collect_sessions(sdir) if sdir else None))
         return 0
     srv = http.server.ThreadingHTTPServer((HOST, a.port), Handler)
-    srv.runs, srv.usage = runs, usage
+    srv.runs, srv.usage, srv.sessions = runs, usage, sdir
     usage.get()
     print(f"nufra page: http://{HOST}:{srv.server_address[1]}  (read only; Ctrl-C to stop)", flush=True)
     try:

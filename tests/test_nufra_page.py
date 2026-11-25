@@ -131,6 +131,48 @@ class States(Base):
         self.assertIn("did not answer", r.stdout)
 
 
+class Sessions(Base):
+    def write_sessions(self, windows=True):
+        d = os.path.join(self.tmp, "listener")
+        os.makedirs(d, exist_ok=True)
+        now = time.time()
+        json.dump({"C1:1.1": {"workspace": "shop", "cli": "claude", "topic": "build M2"},
+                   "C1:2.2": {"workspace": "cafe", "cli": "claude", "topic": "ask council"},
+                   "C1:3.3": {"workspace": "old", "cli": "claude", "topic": "closed window"}},
+                  open(os.path.join(d, "sessions.json"), "w"))
+        json.dump({"C1:1.1": {"text": "Phase 3: reproducing", "at": now - 30, "state": "working", "step": "3/7"},
+                   "C1:2.2": {"text": "Waiting for you: pick 1 or 2", "at": now - 600, "state": "waiting"},
+                   "C1:3.3": {"text": "Done", "at": now - 60, "state": "done"}},
+                  open(os.path.join(d, "progress.json"), "w"))
+        if windows:
+            json.dump({"C1:1.1": 1, "C1:2.2": 2}, open(os.path.join(d, "windows.json"), "w"))
+        open(os.path.join(d, "config.json"), "w").write('{"bot_token": "xoxb-secret-token-123456"}')
+        return d
+
+    def page(self, d):
+        r = subprocess.run([sys.executable, TOOL, "--runs", self.runs, "--sessions", d, "--once"],
+                           capture_output=True, text=True, env=self.env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r.stdout
+
+    def test_open_windows_only_and_waiting_on_top(self):
+        page = self.page(self.write_sessions())
+        self.assertIn("<h2>Slack sessions</h2>", page)
+        self.assertIn("Phase 3: reproducing", page)
+        self.assertIn('aria-label="step 3 of 7"', page)
+        self.assertNotIn("closed window", page)               # window gone: not shown, like the Home tab
+        self.assertIn("Waiting on you (2)", page)              # 1 run + 1 session
+        self.assertLess(page.index("pick 1 or 2"), page.index("Phase 3: reproducing"))
+        self.assertNotIn("xoxb-secret", page)                  # the token file is never read
+
+    def test_without_windows_file_uses_age(self):
+        page = self.page(self.write_sessions(windows=False))
+        self.assertIn("closed window", page)                   # done 1 min ago: inside 24 h
+
+    def test_off_by_default(self):
+        self.assertNotIn("Slack sessions", self.once())
+
+
 class Privacy(Base):
     def test_no_home_path_no_secret(self):
         d = os.path.join(self.runs, "idle-run")
