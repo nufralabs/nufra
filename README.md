@@ -20,6 +20,7 @@ nufra switches a harness only on your command and never rotates accounts.
 - `bin/nufra-handoff` write and check the resume point (`handoff.md`)
 - `bin/nufra-continue` the continuation prompt for the next agent (only when the resume point is safe), and each agent's resume line. Adapted from Orca, see `NOTICE`
 - `adapters/command-code/nufra-cmd` hand-off to Command Code: guards, the user runs `cmd`, then collect
+- `adapters/claude-gateway/nufra-gateway` Claude Code on an Anthropic-format gateway (one model, no MCP)
 - `bin/nufra-page` one read-only page on http://127.0.0.1:7401: what waits on you, weekly usage, every run with its state (colour + shape + word). Stdlib, no JavaScript, writes nothing
 - `core/favicon.svg`, `core/mark.svg` the mark (seed in the notch)
 - `bin/test` run all tests

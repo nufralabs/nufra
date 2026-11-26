@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+"""nufra-gateway: run Claude Code against an Anthropic-format gateway (for example a prepaid router), so the same
+workflow, skills and hooks keep working while only the model and the bill change.
+
+The gateway session is a full Claude Code session, so it is a coordinator like any Claude session: it follows the
+same gate rules (only the user closes a gate). It is NOT a resume of the old chat: it starts fresh from handoff.md.
+
+A profile is a local JSON file (never in this repo), for example ~/.config/nufra/gateways/NAME.json:
+    {"name": "router", "base_url": "https://gateway.example", "key_file": "~/.router-secret", "model": "model-id"}
+
+Commands:
+  nufra-gateway check  --profile P                 validate the profile; print the settings with the key hidden
+  nufra-gateway exec   --profile P -- [claude args] run claude with the profile (used by launchers)
+  nufra-gateway start  --profile P --run RUN_DIR --repo REPO [--window] [--intro TEXT] [--dry-run]
+                                                   guards, then a fresh session from handoff.md; holds the pen
+  nufra-gateway release --run RUN_DIR              give the pen back (remove RUN_DIR/.pen.json written by start)
+
+Guards (exit 4 = refused):
+  G1 MCP:   claude starts with --strict-mcp-config and an empty MCP file, so no MCP server loads
+  G2 key:   the key file exists, is not empty and is readable by its owner only (mode 600); https base URL only
+  G3 model: one model for every slot (main, haiku/sonnet/opus/fable aliases, subagents, auto mode), so no call
+            goes to a model the user did not pick
+  G4 one:   no other harness holds the pen (RUN_DIR/.pen.json)
+  G5 resume: `nufra-handoff check` says OK before start
+The key is passed to the child process environment only. It is never printed, logged or written to disk.
+Stdlib only.
+"""
+import argparse
+import json
+import os
+import shlex
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.normpath(os.path.join(HERE, "..", ".."))
+HANDOFF = os.path.join(ROOT, "bin", "nufra-handoff")
+CONTINUE = os.path.join(ROOT, "bin", "nufra-continue")
+MODEL_VARS = ("ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
+              "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_FABLE_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL",
+              "CLAUDE_CODE_AUTO_MODE_MODEL")
+CLEAR_VARS = ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_SMALL_FAST_MODEL", "CLAUDE_CODE_USE_BEDROCK",
+              "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY")
+
+
+def refuse(msg):
+    print(f"REFUSED: {msg}")
+    sys.exit(4)
+
+
+def load_profile(path):
+    path = os.path.expanduser(path)
+    try:
+        with open(path) as fh:
+            p = json.load(fh)
+    except (OSError, ValueError) as exc:
+        refuse(f"profile {path}: {exc.__class__.__name__}")
+    for k in ("name", "base_url", "key_file", "model"):
+        if not str(p.get(k) or "").strip():
+            refuse(f"profile {path}: '{k}' is missing")
+    if not p["base_url"].startswith("https://"):
+        refuse("G2 key: base_url must start with https://")
+    if any(k in p for k in ("key", "api_key", "token")):
+        refuse("profile must point to a key file (key_file), never hold the key itself")
+    return p
+
+
+def read_key(p):
+    kf = os.path.expanduser(p["key_file"])
+    try:
+        st = os.stat(kf)
+    except OSError:
+        refuse(f"G2 key: key file {p['key_file']} not found")
+    if st.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+        refuse(f"G2 key: {p['key_file']} is readable by other users; run chmod 600 {p['key_file']}")
+    key = open(kf).read().strip()
+    if not key or "\n" in key:
+        refuse(f"G2 key: {p['key_file']} must hold one key on one line")
+    return key
+
+
+def child_env(p, key):
+    env = dict(os.environ)
+    for v in CLEAR_VARS:
+        env.pop(v, None)
+    env["ANTHROPIC_BASE_URL"] = p["base_url"].rstrip("/")
+    env["ANTHROPIC_API_KEY"] = key
+    for v in MODEL_VARS:
+        env[v] = p["model"]
+    env["CLAUDE_CODE_SUBAGENT_MODEL_FORCE"] = "1"
+    env["NUFRA_GATEWAY"] = p["name"]
+    return env
+
+
+def empty_mcp():
+    fd, path = tempfile.mkstemp(prefix="nufra-gateway-mcp-", suffix=".json")
+    with os.fdopen(fd, "w") as fh:
+        fh.write('{"mcpServers":{}}\n')
+    return path
+
+
+def claude_argv(extra):
+    return ["claude", "--strict-mcp-config", "--mcp-config", empty_mcp(), *extra]
+
+
+def cmd_check(a):
+    p = load_profile(a.profile)
+    key = read_key(p)
+    print(f"profile {p['name']}: OK")
+    print(f"  ANTHROPIC_BASE_URL={p['base_url'].rstrip('/')}")
+    print(f"  ANTHROPIC_API_KEY=<{len(key)} chars from {p['key_file']}>")
+    for v in MODEL_VARS:
+        print(f"  {v}={p['model']}")
+    print("  CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1")
+    print("  claude --strict-mcp-config --mcp-config <empty>   (no MCP servers)")
+    return 0
+
+
+def cmd_exec(a):
+    p = load_profile(a.profile)
+    key = read_key(p)
+    argv = claude_argv([x for x in a.claude_args if x != "--"])
+    os.execvpe(argv[0], argv, child_env(p, key))
+
+
+def handoff_fields(run_dir):
+    out = {}
+    try:
+        for line in open(os.path.join(run_dir, "handoff.md")).read().splitlines():
+            if line.startswith("- ") and ": " in line:
+                k, v = line[2:].split(": ", 1)
+                out[k.strip()] = v.strip()
+    except OSError:
+        pass
+    return out
+
+
+def open_window(command):
+    script = f'tell application "Terminal"\nset t to do script {json.dumps(command)}\ndelay 1\n' \
+             'return id of (first window whose selected tab is t)\nend tell'
+    r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    if r.returncode != 0:
+        refuse(f"could not open a Terminal window: {r.stderr.strip()[:200]}")
+    return int(r.stdout.strip())
+
+
+def cmd_start(a):
+    p = load_profile(a.profile)
+    read_key(p)  # G2 before anything is written
+    run_dir = os.path.abspath(a.run)
+    pen = os.path.join(run_dir, ".pen.json")
+    if os.path.exists(pen):
+        try:
+            holder = json.load(open(pen)).get("harness", "?")
+        except ValueError:
+            holder = "?"
+        refuse(f"G4 one agent: {holder} already holds the pen ({pen})")
+    r = subprocess.run([sys.executable, HANDOFF, "check", run_dir, "--repo", a.repo], capture_output=True, text=True)
+    if r.returncode != 0 or not r.stdout.startswith("OK"):
+        refuse(f"G5 resume: nufra-handoff check: {(r.stdout + r.stderr).strip()[:300]}")
+    c = subprocess.run([sys.executable, CONTINUE, "prompt", run_dir, "--repo", a.repo], capture_output=True, text=True)
+    if c.returncode != 0:
+        refuse(f"nufra-continue: {(c.stdout + c.stderr).strip()[:300]}")
+    prompt = (a.intro + "\n\n" if a.intro else "") + c.stdout.strip()
+    session_id = str(uuid.uuid4())
+    me = os.path.abspath(__file__)
+    command = (f"cd {shlex.quote(os.path.abspath(a.workdir or a.repo))} && {shlex.quote(sys.executable)} "
+               f"{shlex.quote(me)} exec --profile {shlex.quote(a.profile)} -- --session-id {session_id} "
+               f"{shlex.quote(prompt)}")
+    if a.dry_run:
+        print(json.dumps({"dry_run": True, "session_id": session_id, "command": command[:400] + "…"}, indent=2))
+        return 0
+    fields = handoff_fields(run_dir)
+    with open(pen, "w") as fh:
+        json.dump({"harness": f"claude@{p['name']}", "model": p["model"], "phase": fields.get("phase", ""),
+                   "session_id": session_id, "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}, fh,
+                  indent=2)
+    if a.window:
+        wid = open_window(command)
+        print(json.dumps({"ok": True, "window_id": wid, "session_id": session_id,
+                          "launch": f"{shlex.quote(sys.executable)} {shlex.quote(me)} exec --profile "
+                                    f"{shlex.quote(a.profile)} --"}))
+        return 0
+    os.execvp("/bin/sh", ["/bin/sh", "-c", command])
+
+
+def cmd_release(a):
+    pen = os.path.join(os.path.abspath(a.run), ".pen.json")
+    if not os.path.exists(pen):
+        print("no pen file: nothing to release")
+        return 0
+    holder = json.load(open(pen)).get("harness", "")
+    if not holder.startswith("claude@"):
+        refuse(f"the pen is held by {holder}, not by a gateway session")
+    os.remove(pen)
+    print(f"released: {holder} no longer holds {a.run}")
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="nufra-gateway")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    c = sub.add_parser("check")
+    c.add_argument("--profile", required=True)
+    e = sub.add_parser("exec")
+    e.add_argument("--profile", required=True)
+    e.add_argument("claude_args", nargs=argparse.REMAINDER)
+    s = sub.add_parser("start")
+    s.add_argument("--profile", required=True)
+    s.add_argument("--run", required=True)
+    s.add_argument("--repo", required=True)
+    s.add_argument("--workdir", help="folder to start claude in (default: --repo)")
+    s.add_argument("--intro", default="")
+    s.add_argument("--window", action="store_true", help="open a new Terminal window (macOS)")
+    s.add_argument("--dry-run", action="store_true")
+    r = sub.add_parser("release")
+    r.add_argument("--run", required=True)
+    a = ap.parse_args(argv)
+    return {"check": cmd_check, "exec": cmd_exec, "start": cmd_start, "release": cmd_release}[a.cmd](a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
