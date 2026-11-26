@@ -22,7 +22,8 @@ Guards (exit 4 = refused):
             goes to a model the user did not pick
   G4 one:   no other harness holds the pen (RUN_DIR/.pen.json)
   G5 resume: `nufra-handoff check` says OK before start
-The key is passed to the child process environment only. It is never printed, logged or written to disk.
+The key reaches Claude Code through an apiKeyHelper that reads the key file, so it is not in the environment and
+Claude Code does not ask about it. It is never printed, logged or written to another file.
 Stdlib only.
 """
 import argparse
@@ -87,8 +88,8 @@ def child_env(p, key):
     env = dict(os.environ)
     for v in CLEAR_VARS:
         env.pop(v, None)
+    env.pop("ANTHROPIC_API_KEY", None)  # the key comes from apiKeyHelper, so Claude Code does not ask about it
     env["ANTHROPIC_BASE_URL"] = p["base_url"].rstrip("/")
-    env["ANTHROPIC_API_KEY"] = key
     for v in MODEL_VARS:
         env[v] = p["model"]
     env["CLAUDE_CODE_SUBAGENT_MODEL_FORCE"] = "1"
@@ -103,8 +104,16 @@ def empty_mcp():
     return path
 
 
-def claude_argv(extra):
-    return ["claude", "--strict-mcp-config", "--mcp-config", empty_mcp(), *extra]
+def helper_settings(p):
+    """A settings file whose apiKeyHelper prints the key file. The key itself is never written anywhere."""
+    fd, path = tempfile.mkstemp(prefix="nufra-gateway-settings-", suffix=".json")
+    with os.fdopen(fd, "w") as fh:
+        json.dump({"apiKeyHelper": "/bin/cat " + shlex.quote(os.path.expanduser(p["key_file"]))}, fh)
+    return path
+
+
+def claude_argv(extra, p):
+    return ["claude", "--strict-mcp-config", "--mcp-config", empty_mcp(), "--settings", helper_settings(p), *extra]
 
 
 def cmd_check(a):
@@ -112,7 +121,7 @@ def cmd_check(a):
     key = read_key(p)
     print(f"profile {p['name']}: OK")
     print(f"  ANTHROPIC_BASE_URL={p['base_url'].rstrip('/')}")
-    print(f"  ANTHROPIC_API_KEY=<{len(key)} chars from {p['key_file']}>")
+    print(f"  apiKeyHelper=/bin/cat {p['key_file']}   (key: {len(key)} chars, never in the environment)")
     for v in MODEL_VARS:
         print(f"  {v}={p['model']}")
     print("  CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1")
@@ -123,7 +132,7 @@ def cmd_check(a):
 def cmd_exec(a):
     p = load_profile(a.profile)
     key = read_key(p)
-    argv = claude_argv([x for x in a.claude_args if x != "--"])
+    argv = claude_argv([x for x in a.claude_args if x != "--"], p)
     os.execvpe(argv[0], argv, child_env(p, key))
 
 
@@ -168,12 +177,16 @@ def cmd_start(a):
     prompt = (a.intro + "\n\n" if a.intro else "") + c.stdout.strip()
     session_id = str(uuid.uuid4())
     me = os.path.abspath(__file__)
+    # The prompt goes in a file: a long multi-line prompt typed into a terminal can break the shell line.
+    prompt_file = os.path.join(run_dir, ".nufra-gateway-prompt.md")
     command = (f"cd {shlex.quote(os.path.abspath(a.workdir or a.repo))} && {shlex.quote(sys.executable)} "
                f"{shlex.quote(me)} exec --profile {shlex.quote(a.profile)} -- --session-id {session_id} "
-               f"{shlex.quote(prompt)}")
+               f"\"$(cat {shlex.quote(prompt_file)})\"")
     if a.dry_run:
         print(json.dumps({"dry_run": True, "session_id": session_id, "command": command[:400] + "…"}, indent=2))
         return 0
+    with open(prompt_file, "w") as fh:
+        fh.write(prompt + "\n")
     fields = handoff_fields(run_dir)
     with open(pen, "w") as fh:
         json.dump({"harness": f"claude@{p['name']}", "model": p["model"], "phase": fields.get("phase", ""),

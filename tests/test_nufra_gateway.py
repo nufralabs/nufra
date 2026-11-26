@@ -62,6 +62,7 @@ class Check(Base):
                   "CLAUDE_CODE_AUTO_MODE_MODEL"):
             self.assertIn(f"{v}=m-1", r.stdout)
         self.assertIn("--strict-mcp-config", r.stdout)
+        self.assertIn("apiKeyHelper", r.stdout)
 
     def test_key_readable_by_others_refused(self):
         os.chmod(self.key, 0o644)
