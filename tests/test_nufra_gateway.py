@@ -234,6 +234,14 @@ class Delegation(Base):
         self.assertIn("Batch", note)
         self.assertIn("Never let a subagent decide", note)
 
+    def test_note_carries_the_orchestrator_rule(self):
+        g = load_gateway()
+        note = g.delegation_note({"model": "m-1", "subagent_model": "free-small", "delegation": "always"})
+        self.assertIn("orchestrator, not the worker", note)
+        self.assertIn("6 calls or fewer", note)
+        self.assertIn("subagents here run on free-small", note)
+        self.assertNotIn("cheaper inline", note)
+
     def test_note_falls_back_to_main_model(self):
         self.write_profile(delegation="always")
         g = load_gateway()

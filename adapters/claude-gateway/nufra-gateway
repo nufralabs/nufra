@@ -63,16 +63,18 @@ DELEGATION = ("always",)
 DELEGATION_TEXT = {
     "always": (
         "Delegation (this profile's default, always on for every window it opens):\n"
-        "1. Batch. Every independent read-only call in one turn goes in ONE message: all reads, greps, git\n"
-        "   queries and test runs together. A second call is allowed only when it needs the first one's answer.\n"
-        "2. Delegate bulk reading. When a step means reading a large file, a long log or many files to reach a\n"
-        "   conclusion, send it to a subagent (subagents here run on {sub}) and keep only its verdict and the\n"
-        "   path. Do not read a big file into this window to answer a question about it.\n"
-        "3. Decide locally. The subagent reports facts with line numbers. This window makes every judgement,\n"
-        "   every gate, and every Slack/commit message. Never let a subagent decide.\n"
-        "4. Pipe long success output through `tail -n 40`. Never cut error output.\n"
-        "5. A one-line call is cheaper inline than briefed. Delegation pays when the reading is large, not\n"
-        "   when the call is small."
+        "1. This window is the orchestrator, not the worker. It takes the order, briefs a subagent, judges the\n"
+        "   report, then briefs the next one. It writes no file, reads no file and runs no command itself. Every\n"
+        "   read, grep, git query and test run goes to a subagent: subagents here run on {sub}.\n"
+        "2. Batch. A chain of checks is ONE brief, never a call each. Every independent call a brief can make\n"
+        "   goes in the same round.\n"
+        "3. Count the calls. Each call re-reads the whole conversation, so the bill comes from the count, not the\n"
+        "   size. Keep this window to 6 calls or fewer in a turn. A one-line lookup is still the subagent's job.\n"
+        "4. Spend only on the named work. A problem the user did not ask about waits for the user. Do not fix it,\n"
+        "   do not draw it, do not ask about it.\n"
+        "5. Decide locally. The subagent reports facts with line numbers. This window makes every judgement, every\n"
+        "   gate and every Slack/commit message. Never let a subagent decide.\n"
+        "6. Pipe long success output through `tail -n 40`. Never cut error output."
     ),
 }
 
