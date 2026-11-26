@@ -279,6 +279,37 @@ class Delegation(Base):
         self.assertFalse(body.startswith("\n"))
         self.assertTrue(body.startswith("Delegation"))
 
+    def test_effort_flag_on_argv(self):
+        self.write_profile(effort="high")
+        g = load_gateway()
+        argv = g.claude_argv(["--session-id", "s-1"], g.load_profile(self.profile))
+        i = argv.index("--effort")
+        self.assertEqual(argv[i + 1], "high")
+        self.assertLess(i, argv.index("--session-id"))
+
+    def test_no_effort_flag_when_unset(self):
+        g = load_gateway()
+        argv = g.claude_argv(["--session-id", "s-1"], g.load_profile(self.profile))
+        self.assertNotIn("--effort", argv)
+
+    def test_subagent_effort_in_child_env(self):
+        self.write_profile(effort="high")
+        g = load_gateway()
+        env = g.child_env(g.load_profile(self.profile), FAKE)
+        self.assertEqual(env["CLAUDE_CODE_SUBAGENT_EFFORT"], "high")
+        self.assertNotIn("CLAUDE_CODE_EFFORT_LEVEL", env)  # would remove the Agent tool's per-call effort field
+
+    def test_subagent_effort_absent_when_unset(self):
+        g = load_gateway()
+        env = g.child_env(g.load_profile(self.profile), FAKE)
+        self.assertNotIn("CLAUDE_CODE_SUBAGENT_EFFORT", env)
+
+    def test_effort_is_validated(self):
+        self.write_profile(effort="maximum")
+        r = self.tool("check", "--profile", self.profile)
+        self.assertEqual(r.returncode, 4)
+        self.assertIn("effort must be one of", r.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

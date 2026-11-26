@@ -60,6 +60,7 @@ MODES = ("default", "acceptEdits", "plan", "auto", "dontAsk")
 # the main window keeps the judgement. The subagent model is the profile's subagent_model, so on a router with a
 # free small model the reading costs nothing on the main bill.
 DELEGATION = ("always",)
+EFFORT = ("low", "medium", "high", "xhigh", "max")
 DELEGATION_TEXT = {
     "always": (
         "Delegation (this profile's default, always on for every window it opens):\n"
@@ -107,6 +108,9 @@ def load_profile(path):
     deliver = p.get("delegation")
     if deliver is not None and deliver not in DELEGATION:
         refuse("delegation must be one of: " + ", ".join(DELEGATION))
+    eff = p.get("effort")
+    if eff is not None and eff not in EFFORT:
+        refuse("effort must be one of: " + ", ".join(EFFORT))
     return p
 
 
@@ -148,6 +152,9 @@ def child_env(p, key):
     # model_not_found, a real free name answers. Absent the key, behaviour is exactly as before.
     env["CLAUDE_CODE_SUBAGENT_MODEL"] = (p.get("subagent_model") or p["model"]).strip()
     env["CLAUDE_CODE_SUBAGENT_MODEL_FORCE"] = "1"
+    # The subagent effort slot moves with the profile.
+    if p.get("effort"):
+        env["CLAUDE_CODE_SUBAGENT_EFFORT"] = p["effort"]
     env["NUFRA_GATEWAY"] = p["name"]
     return env
 
@@ -179,7 +186,10 @@ def helper_settings(p):
 
 
 def claude_argv(extra, p):
-    return ["claude", "--strict-mcp-config", "--mcp-config", empty_mcp(), "--settings", helper_settings(p), *extra]
+    argv = ["claude", "--strict-mcp-config", "--mcp-config", empty_mcp(), "--settings", helper_settings(p)]
+    if p.get("effort"):
+        argv += ["--effort", p["effort"]]
+    return argv + list(extra)
 
 
 def cmd_check(a):
@@ -197,6 +207,8 @@ def cmd_check(a):
     print("  CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1")
     if p.get("delegation"):
         print(f"  delegation={p['delegation']}   (batch + delegate rule carried in every launch prompt)")
+    if p.get("effort"):
+        print(f"  effort={p['effort']}   (--effort for this window, CLAUDE_CODE_SUBAGENT_EFFORT for its subagents)")
     print("  claude --strict-mcp-config --mcp-config <empty>   (no MCP servers)")
     return 0
 
