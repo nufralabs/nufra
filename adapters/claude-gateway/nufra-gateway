@@ -55,6 +55,26 @@ CLEAR_VARS = ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_SMALL_FAST_MODEL", "CLAUDE_CODE
 # model judges every tool call, which is the extra wait and the extra tokens this adapter exists to avoid.
 # A profile may still opt into auto, but it has to say so.
 MODES = ("default", "acceptEdits", "plan", "auto", "dontAsk")
+# Delegation DNA. A profile may name one mode, and every window it opens carries that rule in its launch prompt.
+# "always": batch independent calls into one message, and send bulk reading to a subagent that reports facts while
+# the main window keeps the judgement. The subagent model is the profile's subagent_model, so on a router with a
+# free small model the reading costs nothing on the main bill.
+DELEGATION = ("always",)
+DELEGATION_TEXT = {
+    "always": (
+        "Delegation (this profile's default, always on for every window it opens):\n"
+        "1. Batch. Every independent read-only call in one turn goes in ONE message: all reads, greps, git\n"
+        "   queries and test runs together. A second call is allowed only when it needs the first one's answer.\n"
+        "2. Delegate bulk reading. When a step means reading a large file, a long log or many files to reach a\n"
+        "   conclusion, send it to a subagent (subagents here run on {sub}) and keep only its verdict and the\n"
+        "   path. Do not read a big file into this window to answer a question about it.\n"
+        "3. Decide locally. The subagent reports facts with line numbers. This window makes every judgement,\n"
+        "   every gate, and every Slack/commit message. Never let a subagent decide.\n"
+        "4. Pipe long success output through `tail -n 40`. Never cut error output.\n"
+        "5. A one-line call is cheaper inline than briefed. Delegation pays when the reading is large, not\n"
+        "   when the call is small."
+    ),
+}
 
 
 def refuse(msg):
@@ -82,7 +102,20 @@ def load_profile(path):
     sub = p.get("subagent_model")
     if sub is not None and not isinstance(sub, str):
         refuse("subagent_model must be one model name, as a string")
+    deliver = p.get("delegation")
+    if deliver is not None and deliver not in DELEGATION:
+        refuse("delegation must be one of: " + ", ".join(DELEGATION))
     return p
+
+
+def delegation_note(p):
+    """The rule text a profile adds to its own launch prompt. Empty when the profile sets no delegation mode.
+    This lives in the profile, not the listener, so a window started by hand gets the same rule as one started
+    by a hand-over."""
+    mode = p.get("delegation")
+    if not mode:
+        return ""
+    return DELEGATION_TEXT[mode].format(sub=p.get("subagent_model") or p["model"], model=p["model"])
 
 
 def read_key(p):
@@ -160,6 +193,8 @@ def cmd_check(a):
     if p.get("subagent_model"):
         print(f"  CLAUDE_CODE_SUBAGENT_MODEL={p['subagent_model']}   (subagents only; every other slot stays on {p['model']})")
     print("  CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1")
+    if p.get("delegation"):
+        print(f"  delegation={p['delegation']}   (batch + delegate rule carried in every launch prompt)")
     print("  claude --strict-mcp-config --mcp-config <empty>   (no MCP servers)")
     return 0
 
@@ -192,6 +227,13 @@ def open_window(command):
     return int(r.stdout.strip())
 
 
+def launch_prompt(intro, continue_text, p):
+    """The text the new window reads: the caller's intro, then the profile's own rules, then the resume point.
+    Separate from cmd_start so the assembly can be tested without launching a window."""
+    note = delegation_note(p)
+    return (intro + "\n\n" if intro else "") + (note + "\n\n" if note else "") + continue_text.strip()
+
+
 def cmd_start(a):
     p = load_profile(a.profile)
     read_key(p)  # G2 before anything is written
@@ -209,7 +251,7 @@ def cmd_start(a):
     c = subprocess.run([sys.executable, CONTINUE, "prompt", run_dir, "--repo", a.repo], capture_output=True, text=True)
     if c.returncode != 0:
         refuse(f"nufra-continue: {(c.stdout + c.stderr).strip()[:300]}")
-    prompt = (a.intro + "\n\n" if a.intro else "") + c.stdout.strip()
+    prompt = launch_prompt(a.intro, c.stdout, p)
     session_id = str(uuid.uuid4())
     me = os.path.abspath(__file__)
     # The prompt goes in a file: a long multi-line prompt typed into a terminal can break the shell line.

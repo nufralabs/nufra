@@ -206,5 +206,71 @@ class Start(Base):
         self.assertFalse(os.path.exists(pen))
 
 
+class Delegation(Base):
+    """A profile's delegation mode travels in the launch prompt, so every window it opens carries the rule."""
+
+    def test_refuses_unknown_mode(self):
+        self.write_profile(delegation="sometimes")
+        r = self.tool("check", "--profile", self.profile)
+        self.assertEqual(r.returncode, 4)
+        self.assertIn("delegation must be one of", r.stdout)
+
+    def test_check_names_the_mode(self):
+        self.write_profile(delegation="always")
+        r = self.tool("check", "--profile", self.profile)
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn("delegation=always", r.stdout)
+
+    def test_no_mode_prints_no_line(self):
+        r = self.tool("check", "--profile", self.profile)
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertNotIn("delegation=", r.stdout)
+
+    def test_note_names_the_subagent_model(self):
+        self.write_profile(delegation="always", subagent_model="free-small")
+        g = load_gateway()
+        note = g.delegation_note(g.load_profile(self.profile))
+        self.assertIn("free-small", note)
+        self.assertIn("Batch", note)
+        self.assertIn("Never let a subagent decide", note)
+
+    def test_note_falls_back_to_main_model(self):
+        self.write_profile(delegation="always")
+        g = load_gateway()
+        note = g.delegation_note(g.load_profile(self.profile))
+        self.assertIn("subagents here run on m-1", note)
+
+    def test_no_delegation_means_empty_note(self):
+        g = load_gateway()
+        self.assertEqual(g.delegation_note(g.load_profile(self.profile)), "")
+
+    def test_prompt_file_carries_the_note(self):
+        """The end of the chain that matters: the note lands in the text the window reads.
+        Checks launch_prompt, not `start`: start without --window execs claude, so it cannot be a test."""
+        self.write_profile(delegation="always", subagent_model="free-small")
+        g = load_gateway()
+        body = g.launch_prompt("intro line", "resume point", g.load_profile(self.profile))
+        self.assertIn("intro line", body)
+        self.assertIn("free-small", body)
+        self.assertIn("Batch", body)
+        self.assertIn("resume point", body)
+        # order matters: intro, then rules, then the resume point the rules must not be buried after
+        self.assertLess(body.index("intro line"), body.index("Batch"))
+        self.assertLess(body.index("Batch"), body.index("resume point"))
+
+    def test_prompt_without_delegation_has_no_note(self):
+        g = load_gateway()
+        body = g.launch_prompt("intro line", "resume point", g.load_profile(self.profile))
+        self.assertNotIn("Never let a subagent decide", body)
+        self.assertEqual(body, "intro line\n\nresume point")
+
+    def test_empty_intro_still_carries_the_note(self):
+        self.write_profile(delegation="always")
+        g = load_gateway()
+        body = g.launch_prompt("", "resume point", g.load_profile(self.profile))
+        self.assertFalse(body.startswith("\n"))
+        self.assertTrue(body.startswith("Delegation"))
+
+
 if __name__ == "__main__":
     unittest.main()
