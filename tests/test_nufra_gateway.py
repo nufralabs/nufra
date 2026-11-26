@@ -73,6 +73,34 @@ class Check(Base):
         self.assertIn("--strict-mcp-config", r.stdout)
         self.assertIn("apiKeyHelper", r.stdout)
 
+    def test_subagent_model_moves_only_subagents(self):
+        """G3 with one named exception: the subagent slot takes the profile's model, every other slot keeps m-1."""
+        self.write_profile(subagent_model="free-1")
+        r = self.tool("check", "--profile", self.profile)
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn("CLAUDE_CODE_SUBAGENT_MODEL=free-1", r.stdout)
+        for v in ("ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
+                  "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_FABLE_MODEL", "CLAUDE_CODE_AUTO_MODE_MODEL"):
+            self.assertIn(f"{v}=m-1", r.stdout)
+
+    def test_subagent_model_reaches_the_child_env(self):
+        G = load_gateway()
+        p = G.load_profile(self.profile)
+        env = G.child_env(p, FAKE)
+        self.assertEqual(env["CLAUDE_CODE_SUBAGENT_MODEL"], "m-1")
+        self.write_profile(subagent_model="free-1")
+        p = G.load_profile(self.profile)
+        env = G.child_env(p, FAKE)
+        self.assertEqual(env["CLAUDE_CODE_SUBAGENT_MODEL"], "free-1")
+        self.assertEqual(env["ANTHROPIC_MODEL"], "m-1")
+        self.assertEqual(env["CLAUDE_CODE_AUTO_MODE_MODEL"], "m-1")
+
+    def test_subagent_model_must_be_a_string(self):
+        self.write_profile(subagent_model=["a", "b"])
+        r = self.tool("check", "--profile", self.profile)
+        self.assertEqual(r.returncode, 4)
+        self.assertIn("subagent_model", r.stdout)
+
     def test_key_readable_by_others_refused(self):
         os.chmod(self.key, 0o644)
         r = self.tool("check", "--profile", self.profile)

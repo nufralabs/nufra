@@ -23,7 +23,8 @@ Guards (exit 4 = refused):
   G1 MCP:   claude starts with --strict-mcp-config and an empty MCP file, so no MCP server loads
   G2 key:   the key file exists, is not empty and is readable by its owner only (mode 600); https base URL only
   G3 model: one model for every slot (main, haiku/sonnet/opus/fable aliases, subagents, auto mode), so no call
-            goes to a model the user did not pick
+            goes to a model the user did not pick. One named exception: a profile may set "subagent_model", which
+            moves subagents only, and only to the model the user wrote there.
   G4 one:   no other harness holds the pen (RUN_DIR/.pen.json)
   G5 resume: `nufra-handoff check` says OK before start
 The key reaches Claude Code through an apiKeyHelper that reads the key file, so it is not in the environment and
@@ -78,6 +79,9 @@ def load_profile(path):
     mode = p.get("default_mode", "acceptEdits")
     if mode not in MODES:
         refuse("default_mode must be one of: " + ", ".join(MODES))
+    sub = p.get("subagent_model")
+    if sub is not None and not isinstance(sub, str):
+        refuse("subagent_model must be one model name, as a string")
     return p
 
 
@@ -103,6 +107,11 @@ def child_env(p, key):
     env["ANTHROPIC_BASE_URL"] = p["base_url"].rstrip("/")
     for v in MODEL_VARS:
         env[v] = p["model"]
+    # G3, one named exception: a profile may name a second model for subagents only (e.g. a free one on the same
+    # router). Every other slot stays on p["model"], so no call can go to a model the user did not pick. The probe
+    # on 2026-11-26 showed Claude Code really launches the subagent on this model: a bogus name fails with
+    # model_not_found, a real free name answers. Absent the key, behaviour is exactly as before.
+    env["CLAUDE_CODE_SUBAGENT_MODEL"] = (p.get("subagent_model") or p["model"]).strip()
     env["CLAUDE_CODE_SUBAGENT_MODEL_FORCE"] = "1"
     env["NUFRA_GATEWAY"] = p["name"]
     return env
@@ -145,7 +154,11 @@ def cmd_check(a):
     print(f"  ANTHROPIC_BASE_URL={p['base_url'].rstrip('/')}")
     print(f"  apiKeyHelper=/bin/cat {p['key_file']}   (key: {len(key)} chars, never in the environment)")
     for v in MODEL_VARS:
+        if v == "CLAUDE_CODE_SUBAGENT_MODEL" and p.get("subagent_model"):
+            continue  # printed once, with the value it really gets, on the line below
         print(f"  {v}={p['model']}")
+    if p.get("subagent_model"):
+        print(f"  CLAUDE_CODE_SUBAGENT_MODEL={p['subagent_model']}   (subagents only; every other slot stays on {p['model']})")
     print("  CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1")
     print("  claude --strict-mcp-config --mcp-config <empty>   (no MCP servers)")
     return 0
