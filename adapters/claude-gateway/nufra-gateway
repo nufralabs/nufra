@@ -7,6 +7,10 @@ same gate rules (only the user closes a gate). It is NOT a resume of the old cha
 
 A profile is a local JSON file (never in this repo), for example ~/.config/nufra/gateways/NAME.json:
     {"name": "router", "base_url": "https://gateway.example", "key_file": "~/.router-secret", "model": "model-id"}
+Optional: "default_mode": one of default, acceptEdits, plan, dontAsk (default acceptEdits). The window takes
+this mode and allows Bash, Read, Edit and Write, so no tool call waits on a safety check. Those keys go in
+the window's own settings file, which claude merges over the user and project files: the user's global
+settings keep every key not named here, so other sessions are untouched.
 
 Commands:
   nufra-gateway check  --profile P                 validate the profile; print the settings with the key hidden
@@ -46,6 +50,10 @@ MODEL_VARS = ("ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEF
               "CLAUDE_CODE_AUTO_MODE_MODEL")
 CLEAR_VARS = ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_SMALL_FAST_MODEL", "CLAUDE_CODE_USE_BEDROCK",
               "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY")
+# Permission modes a gateway window may take. The default is acceptEdits, never auto: in auto mode a second
+# model judges every tool call, which is the extra wait and the extra tokens this adapter exists to avoid.
+# A profile may still opt into auto, but it has to say so.
+MODES = ("default", "acceptEdits", "plan", "auto", "dontAsk")
 
 
 def refuse(msg):
@@ -67,6 +75,9 @@ def load_profile(path):
         refuse("G2 key: base_url must start with https://")
     if any(k in p for k in ("key", "api_key", "token")):
         refuse("profile must point to a key file (key_file), never hold the key itself")
+    mode = p.get("default_mode", "acceptEdits")
+    if mode not in MODES:
+        refuse("default_mode must be one of: " + ", ".join(MODES))
     return p
 
 
@@ -105,10 +116,21 @@ def empty_mcp():
 
 
 def helper_settings(p):
-    """A settings file whose apiKeyHelper prints the key file. The key itself is never written anywhere."""
+    """A settings file whose apiKeyHelper prints the key file. The key itself is never written anywhere.
+
+    It also sets this window's permissions, so a gateway window does not pay for a safety check on every
+    tool call. These keys apply to this window only: claude merges a --settings file over the user and
+    project files, so the user's own settings keep every key not named here.
+    """
     fd, path = tempfile.mkstemp(prefix="nufra-gateway-settings-", suffix=".json")
     with os.fdopen(fd, "w") as fh:
-        json.dump({"apiKeyHelper": "/bin/cat " + shlex.quote(os.path.expanduser(p["key_file"]))}, fh)
+        json.dump({
+            "apiKeyHelper": "/bin/cat " + shlex.quote(os.path.expanduser(p["key_file"])),
+            "permissions": {
+                "allow": ["Bash", "Read", "Edit", "Write"],
+                "defaultMode": p.get("default_mode", "acceptEdits"),
+            },
+        }, fh)
     return path
 
 

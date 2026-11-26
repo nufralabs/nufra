@@ -7,11 +7,20 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import importlib.machinery
+import importlib.util
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOOL = os.path.join(HERE, "..", "adapters", "claude-gateway", "nufra-gateway")
 HANDOFF = os.path.join(HERE, "..", "bin", "nufra-handoff")
 FAKE = "fk-test-0000000000000000000000"
+
+
+def load_gateway():
+    loader = importlib.machinery.SourceFileLoader("nufra_gateway_under_test", TOOL)
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("nufra_gateway_under_test", loader))
+    loader.exec_module(mod)
+    return mod
 
 
 def git(repo, *args):
@@ -83,6 +92,61 @@ class Check(Base):
     def test_missing_model_refused(self):
         self.write_profile(model=None)
         self.assertEqual(self.tool("check", "--profile", self.profile).returncode, 4)
+
+
+class Permissions(Base):
+    """A gateway window gets its own mode and tool list, in its own settings file. Other sessions keep theirs."""
+
+    def settings_for(self, **over):
+        """The real settings file the window will get, written by the real function."""
+        self.write_profile(**over)
+        G = load_gateway()
+        prof = G.load_profile(self.profile)
+        path = G.helper_settings(prof)
+        self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
+        return json.load(open(path))
+
+    def test_default_is_accept_edits_not_auto(self):
+        """`auto` makes a second model judge every tool call. That is the wait and the tokens this fixes."""
+        s = self.settings_for()
+        self.assertEqual(s["permissions"]["defaultMode"], "acceptEdits")
+
+    def test_allows_the_four_tools_with_no_matcher(self):
+        allow = self.settings_for()["permissions"]["allow"]
+        for tool in ("Bash", "Read", "Edit", "Write"):
+            self.assertIn(tool, allow, f"{tool} must be allowed with no argument matcher")
+
+    def test_auto_is_never_the_default(self):
+        """Req: acceptEdits is the default. `auto` runs a second model on every tool call, which is the cost."""
+        s = self.settings_for()
+        self.assertEqual(s["permissions"]["defaultMode"], "acceptEdits")
+        self.assertNotEqual(s["permissions"]["defaultMode"], "auto")
+
+    def test_a_profile_may_still_choose_auto(self):
+        """Banning it would take away the user's own choice, so a profile can opt in by name."""
+        self.assertEqual(self.settings_for(default_mode="auto")["permissions"]["defaultMode"], "auto")
+
+    def test_an_unknown_mode_is_refused(self):
+        self.write_profile(default_mode="yolo")
+        r = self.tool("check", "--profile", self.profile)
+        self.assertEqual(r.returncode, 4)
+        self.assertIn("default_mode", r.stdout)
+
+    def test_profile_can_choose_a_documented_mode(self):
+        self.assertEqual(self.settings_for(default_mode="plan")["permissions"]["defaultMode"], "plan")
+
+    def test_key_is_still_only_a_helper_never_in_settings(self):
+        s = self.settings_for()
+        self.assertNotIn(FAKE, json.dumps(s))
+        self.assertIn("apiKeyHelper", s)
+
+    def test_global_settings_are_not_written(self):
+        """The fix must never touch the user's own ~/.claude/settings.json."""
+        global_path = os.path.expanduser("~/.claude/settings.json")
+        before = open(global_path).read() if os.path.exists(global_path) else None
+        self.settings_for()
+        after = open(global_path).read() if os.path.exists(global_path) else None
+        self.assertEqual(before, after, "the gateway wrote to the user's global settings")
 
 
 class Start(Base):
